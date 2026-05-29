@@ -1,0 +1,21 @@
+{
+  "name": "@lale/translator",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "evals": "tsx src/evals.ts"
+  },
+  "dependencies": {
+    "openai": "^4.78.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0",
+    "typescript": "^5.6.3"
+  }
+}
