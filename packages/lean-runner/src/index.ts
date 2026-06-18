@@ -53,7 +53,77 @@ const TRUST_PATTERNS: Array<{ name: string; pattern: RegExp }> = [
 ];
 
 export function scanTrustViolations(source: string): TrustViolation[] {
-  return TRUST_PATTERNS.filter(({ pattern }) => pattern.test(source)).map(({ name }) => ({ name }));
+  const codeOnlySource = stripLeanCommentsAndStrings(source);
+  return TRUST_PATTERNS.filter(({ pattern }) => pattern.test(codeOnlySource)).map(({ name }) => ({ name }));
+}
+
+function stripLeanCommentsAndStrings(source: string): string {
+  let result = '';
+  let index = 0;
+  let blockCommentDepth = 0;
+
+  while (index < source.length) {
+    const current = source[index] ?? '';
+    const next = source[index + 1] ?? '';
+
+    if (blockCommentDepth > 0) {
+      if (current === '/' && next === '-') {
+        blockCommentDepth += 1;
+        result += '  ';
+        index += 2;
+        continue;
+      }
+      if (current === '-' && next === '/') {
+        blockCommentDepth -= 1;
+        result += '  ';
+        index += 2;
+        continue;
+      }
+      result += current === '\n' ? '\n' : ' ';
+      index += 1;
+      continue;
+    }
+
+    if (current === '-' && next === '-') {
+      result += '  ';
+      index += 2;
+      while (index < source.length && source[index] !== '\n') {
+        result += ' ';
+        index += 1;
+      }
+      continue;
+    }
+
+    if (current === '/' && next === '-') {
+      blockCommentDepth = 1;
+      result += '  ';
+      index += 2;
+      continue;
+    }
+
+    if (current === '"') {
+      result += ' ';
+      index += 1;
+      while (index < source.length) {
+        const ch = source[index] ?? '';
+        if (ch === '\\') {
+          result += ' ';
+          if (index + 1 < source.length) result += source[index + 1] === '\n' ? '\n' : ' ';
+          index += 2;
+          continue;
+        }
+        result += ch === '\n' ? '\n' : ' ';
+        index += 1;
+        if (ch === '"') break;
+      }
+      continue;
+    }
+
+    result += current;
+    index += 1;
+  }
+
+  return result;
 }
 
 // ---------------------------------------------------------------------------

@@ -388,6 +388,7 @@ Output a single JSON object:
 
 Rules:
 - Use only names available in the provided Mathlib revision and the listed dependencies.
+- Preserve the frozen theorem declaration exactly; only replace the proof after \`:= by\`.
 - Do NOT use \`sorry\`, \`admit\`, \`unsafe\`, \`native_decide\`, \`#eval\`, or \`IO\`.
 - The proof must close all goals.
 - Use the author's NL argument as a guide, but produce correct Lean — do not blindly translate words.`;

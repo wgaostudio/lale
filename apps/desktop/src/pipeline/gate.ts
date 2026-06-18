@@ -43,10 +43,15 @@ export function runFinalGate(
     violations.push(`Trust violation: ${v.name}`);
   }
 
-  // Frozen header hash must match.
-  // (Re-check: the prover should have used the frozen header as its base.)
-  if (!leanSource.includes(frozenHeader.theoremName)) {
-    violations.push('Proof does not reference the frozen theorem name');
+  // Frozen theorem statement must match. The prover is allowed to replace
+  // `:= by sorry` with a real proof, but not to alter binders, assumptions, or
+  // the conclusion.
+  const frozenDeclarationHead = extractDeclarationHead(frozenHeader.leanSource, frozenHeader.theoremName);
+  const acceptedDeclarationHead = extractDeclarationHead(leanSource, frozenHeader.theoremName);
+  if (!frozenDeclarationHead || !acceptedDeclarationHead) {
+    violations.push('Proof does not contain the frozen theorem declaration');
+  } else if (normalizeDeclarationHead(frozenDeclarationHead) !== normalizeDeclarationHead(acceptedDeclarationHead)) {
+    violations.push('Proof changed the frozen theorem statement');
   }
 
   // Faithfulness gate.
@@ -69,4 +74,19 @@ export function runFinalGate(
   }
 
   return { passed: true, outcome: 'verified', violations };
+}
+
+function extractDeclarationHead(source: string, declarationName: string): string | null {
+  const escapedName = declarationName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const declarationRe = new RegExp(`\\b(?:theorem|lemma)\\s+${escapedName}\\b`);
+  const match = declarationRe.exec(source);
+  if (!match) return null;
+
+  const assignmentIndex = source.indexOf(':=', match.index);
+  if (assignmentIndex === -1) return null;
+  return source.slice(match.index, assignmentIndex);
+}
+
+function normalizeDeclarationHead(source: string): string {
+  return source.replace(/\s+/g, ' ').trim();
 }
