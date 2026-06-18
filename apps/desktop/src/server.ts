@@ -121,7 +121,6 @@ console.log('─'.repeat(60));
 
 ensureDefaultProviderConfigs(db);
 syncDefaultAuxiliaryConfig(db);
-syncProjectProviderConfigsFromGlobal(db);
 
 // ---------------------------------------------------------------------------
 // HTTP server
@@ -908,9 +907,9 @@ async function handleSwitchFormalizer(
     .prepare(
       `UPDATE model_provider_configs
        SET providerKind = 'openaiCompatible', baseUrl = ?, modelId = ?, apiKeyRef = ?, updatedAt = ?
-       WHERE role = 'formalizer'`,
+       WHERE providerConfigId = ? AND projectId IS NULL AND role = 'formalizer'`,
     )
-    .run(spec.baseUrl, spec.modelId, apiKeyRef, new Date().toISOString());
+    .run(spec.baseUrl, spec.modelId, apiKeyRef, new Date().toISOString(), configId);
 
   if (result.changes === 0) {
     sendJson(res, 404, { error: 'Formalizer config not found' });

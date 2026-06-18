@@ -116,13 +116,16 @@ export function selectReachableContext(
     throw new Error(`Target claim not found: ${targetId}`);
   }
 
-  // BFS upstream (follow explicitRef edges backward).
-  const reachable = new Set<string>();
+  // BFS upstream through explicit references. The queue contains labels because
+  // ParsedClaim dependencies are stored as LaTeX labels.
+  const reachableLabels: string[] = [];
+  const seenLabels = new Set<string>();
   const queue = [...targetClaim.dependencies];
   while (queue.length > 0) {
     const next = queue.shift()!;
-    if (reachable.has(next)) continue;
-    reachable.add(next);
+    if (seenLabels.has(next)) continue;
+    seenLabels.add(next);
+    reachableLabels.push(next);
     const node = findNodeByLabel(graph, next);
     if (node) {
       const claim = doc.claims.find((c) => c.id === node.id);
@@ -133,7 +136,7 @@ export function selectReachableContext(
   const resolvedDependencies: ResolvedDependency[] = [];
   const unresolvedDependencyLabels: string[] = [];
 
-  for (const label of targetClaim.dependencies) {
+  for (const label of [...reachableLabels].reverse()) {
     const depNode = findNodeByLabel(graph, label);
     if (depNode) {
       resolvedDependencies.push({

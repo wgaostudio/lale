@@ -83,7 +83,7 @@ export const PROOF_OPTIONAL_THEOREM_KINDS = [
 ] as const satisfies readonly TheoremKind[];
 
 const PROOF_OPTIONAL_KINDS = new Set<TheoremKind>(PROOF_OPTIONAL_THEOREM_KINDS);
-const BEGIN_RE = /\\begin\{([A-Za-z*]+)\}(\[[^\]]*\])?/g;
+const BEGIN_RE = /\\begin\{([A-Za-z]+\*?)\}(\[[^\]]*\])?/g;
 const REF_RE = /\\(?:ref|cref|Cref|autoref|eqref)\{([^}]+)\}/g;
 
 export function isProofOptionalKind(kind: TheoremKind): boolean {
@@ -95,8 +95,9 @@ export function isVerifiableClaimKind(kind: TheoremKind): boolean {
 }
 
 export function parseLatexDocument(source: string): ParsedDocument {
-  const packages = detectPackages(source);
-  const theoremDefinitions = detectTheoremDefinitions(source);
+  const scanSource = maskLatexComments(source);
+  const packages = detectPackages(scanSource);
+  const theoremDefinitions = detectTheoremDefinitions(scanSource);
   const claims = parseClaims(source);
   const issues: DocumentIssue[] = [];
 
@@ -105,26 +106,30 @@ export function parseLatexDocument(source: string): ParsedDocument {
   addClaimIssues(claims, issues);
 
   const labels = new Map<string, ParsedClaim>();
-  const duplicateLabels = new Set<string>();
+  const claimsByLabel = new Map<string, ParsedClaim[]>();
 
   for (const claim of claims) {
     if (!claim.label) continue;
-    if (labels.has(claim.label)) {
-      duplicateLabels.add(claim.label);
-    } else {
+    const matchingClaims = claimsByLabel.get(claim.label) ?? [];
+    matchingClaims.push(claim);
+    claimsByLabel.set(claim.label, matchingClaims);
+    if (!labels.has(claim.label)) {
       labels.set(claim.label, claim);
     }
   }
 
-  for (const label of duplicateLabels) {
-    const claim = labels.get(label);
-    issues.push({
-      id: `duplicate-label:${label}`,
-      severity: 'error',
-      message: `Duplicate label "${label}". Labels must identify one claim.`,
-      line: claim?.startLine ?? null,
-      claimId: claim?.id ?? null,
-    });
+  for (const [label, matchingClaims] of claimsByLabel) {
+    if (matchingClaims.length < 2) continue;
+    labels.delete(label);
+    for (const claim of matchingClaims) {
+      issues.push({
+        id: `duplicate-label:${label}:${claim.startLine}`,
+        severity: 'error',
+        message: `Duplicate label "${label}". Labels must identify one claim.`,
+        line: claim.startLine,
+        claimId: claim.id,
+      });
+    }
   }
 
   const edges: DependencyEdge[] = [];
@@ -132,6 +137,18 @@ export function parseLatexDocument(source: string): ParsedDocument {
 
   for (const claim of claims) {
     for (const dependency of claim.dependencies) {
+      const matchingClaims = claimsByLabel.get(dependency) ?? [];
+      if (matchingClaims.length > 1) {
+        issues.push({
+          id: `ambiguous-ref:${claim.id}:${dependency}`,
+          severity: 'error',
+          message: `Reference "${dependency}" is ambiguous because multiple claims use that label.`,
+          line: claim.startLine,
+          claimId: claim.id,
+        });
+        continue;
+      }
+
       const target = labels.get(dependency);
       if (!target) {
         issues.push({
@@ -169,27 +186,29 @@ export function parseLatexDocument(source: string): ParsedDocument {
 function parseClaims(source: string): ParsedClaim[] {
   const claims: ParsedClaim[] = [];
   const lineStarts = computeLineStarts(source);
+  const scanSource = maskLatexComments(source);
   BEGIN_RE.lastIndex = 0;
 
   let match: RegExpExecArray | null;
-  while ((match = BEGIN_RE.exec(source))) {
-    const envName = match[1]?.replace(/\*$/, '') as TheoremKind | undefined;
-    if (!envName || !isClaimKind(envName)) continue;
+  while ((match = BEGIN_RE.exec(scanSource))) {
+    const rawEnvName = match[1];
+    const envName = rawEnvName?.replace(/\*$/, '') as TheoremKind | undefined;
+    if (!rawEnvName || !envName || !isClaimKind(envName)) continue;
 
     const beginStart = match.index;
     const bodyStart = BEGIN_RE.lastIndex;
-    const end = findEnvironmentEnd(source, envName, bodyStart);
+    const end = findEnvironmentEnd(scanSource, rawEnvName, bodyStart);
     if (!end) continue;
 
     const rawBody = source.slice(bodyStart, end.start);
     const title = match[2] ? match[2].slice(1, -1).trim() : null;
     const label = extractLabel(rawBody);
-    const proof = findAdjacentProof(source, end.end);
+    const proof = findAdjacentProof(source, scanSource, end.end);
     const dependencyText = `${rawBody}\n${proof?.text ?? ''}`;
     const dependencies = unique(extractRefs(dependencyText).filter((ref) => ref !== label));
     const bodyEnd = proof?.endOffset ?? end.end;
     const statement = cleanLatexStatement(rawBody);
-    const id = label ?? `${envName}:${claims.length + 1}`;
+    const id = uniqueClaimId(label ?? `${envName}:${claims.length + 1}`, claims);
 
     claims.push({
       id,
@@ -340,22 +359,35 @@ function findEnvironmentEnd(
   envName: string,
   from: number,
 ): { start: number; end: number } | null {
-  const endPattern = `\\end{${envName}}`;
-  const start = source.indexOf(endPattern, from);
-  if (start === -1) return null;
-  return { start, end: start + endPattern.length };
+  const escapedEnvName = escapeRegExp(envName);
+  const boundaryRe = new RegExp(`\\\\(?:begin|end)\\{${escapedEnvName}\\}`, 'g');
+  boundaryRe.lastIndex = from;
+
+  let depth = 1;
+  let match: RegExpExecArray | null;
+  while ((match = boundaryRe.exec(source))) {
+    const token = match[0] ?? '';
+    if (token.startsWith('\\begin')) depth += 1;
+    else depth -= 1;
+
+    if (depth === 0) {
+      return { start: match.index, end: boundaryRe.lastIndex };
+    }
+  }
+
+  return null;
 }
 
-function findAdjacentProof(source: string, from: number): ParsedProof | null {
+function findAdjacentProof(source: string, scanSource: string, from: number): ParsedProof | null {
   const lineStarts = computeLineStarts(source);
-  const next = source.slice(from);
+  const next = scanSource.slice(from);
   const skipped = next.match(/^(?:\s|%[^\n]*(?:\n|$))*/)?.[0].length ?? 0;
   const beginOffset = from + skipped;
-  const beginMatch = source.slice(beginOffset).match(/^\\begin\{proof\}(\[[^\]]*\])?/);
+  const beginMatch = scanSource.slice(beginOffset).match(/^\\begin\{proof\}(\[[^\]]*\])?/);
   if (!beginMatch) return null;
 
   const bodyStart = beginOffset + beginMatch[0].length;
-  const end = findEnvironmentEnd(source, 'proof', bodyStart);
+  const end = findEnvironmentEnd(scanSource, 'proof', bodyStart);
   if (!end) return null;
 
   return {
@@ -368,14 +400,15 @@ function findAdjacentProof(source: string, from: number): ParsedProof | null {
 }
 
 function extractLabel(source: string): string | null {
-  return source.match(/\\label\{([^}]+)\}/)?.[1] ?? null;
+  return maskLatexComments(source).match(/\\label\{([^}]+)\}/)?.[1] ?? null;
 }
 
 function extractRefs(source: string): string[] {
   const refs: string[] = [];
+  const scanSource = maskLatexComments(source);
   REF_RE.lastIndex = 0;
   let match: RegExpExecArray | null;
-  while ((match = REF_RE.exec(source))) {
+  while ((match = REF_RE.exec(scanSource))) {
     const labels = match[1]?.split(',').map((value) => value.trim()).filter(Boolean) ?? [];
     refs.push(...labels);
   }
@@ -383,11 +416,41 @@ function extractRefs(source: string): string[] {
 }
 
 function cleanLatexStatement(source: string): string {
-  return source
+  return maskLatexComments(source)
     .replace(/\\label\{[^}]+\}/g, '')
-    .replace(/%[^\n]*/g, '')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function maskLatexComments(source: string): string {
+  let result = '';
+  let escapedBackslashes = 0;
+  let inComment = false;
+
+  for (const ch of source) {
+    if (inComment) {
+      if (ch === '\n') {
+        inComment = false;
+        escapedBackslashes = 0;
+        result += '\n';
+      } else {
+        result += ' ';
+      }
+      continue;
+    }
+
+    if (ch === '%' && escapedBackslashes % 2 === 0) {
+      inComment = true;
+      result += ' ';
+      escapedBackslashes = 0;
+      continue;
+    }
+
+    result += ch;
+    escapedBackslashes = ch === '\\' ? escapedBackslashes + 1 : 0;
+  }
+
+  return result;
 }
 
 function computeLineStarts(source: string): number[] {
@@ -429,6 +492,22 @@ function isClaimKind(value: string): value is TheoremKind {
   return CLAIM_KINDS.includes(value as TheoremKind);
 }
 
+function uniqueClaimId(baseId: string, existingClaims: ParsedClaim[]): string {
+  if (!existingClaims.some((claim) => claim.id === baseId)) return baseId;
+
+  let suffix = 2;
+  let candidate = `${baseId}#${suffix}`;
+  while (existingClaims.some((claim) => claim.id === candidate)) {
+    suffix += 1;
+    candidate = `${baseId}#${suffix}`;
+  }
+  return candidate;
+}
+
 function capitalize(value: string): string {
   return `${value.slice(0, 1).toUpperCase()}${value.slice(1)}`;
+}
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
