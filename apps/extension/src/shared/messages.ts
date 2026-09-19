@@ -1,12 +1,14 @@
 import type { ParsedDocument } from '@lale/document-parser';
 import type {
   AcceptedRunResponse,
+  VerificationMode,
   DesktopProject,
   ExtensionClaimStatus,
   HealthResponse,
   InformalAuditVerdict,
   OverleafDocumentSnapshot,
   OverleafProjectContext,
+  ProviderConfigSummary,
   ProvisionEvent,
   ProvisionStateResponse,
   RunEvent,
@@ -14,23 +16,12 @@ import type {
   VerificationOutcome,
 } from '@lale/protocol';
 
-export interface FormalizerOption {
-  optionKey: 'novita' | 'featherless';
-  label: string;
-  provider: string;
-  baseUrl: string;
-  modelId: string;
-  active: boolean;
-  hasKey: boolean;
-  configId: string;
-}
-
-export interface AuxiliaryConfigInfo {
-  providerConfigId: string;
-  modelId: string;
-  baseUrl: string | null;
-  hasKey: boolean;
-}
+/**
+ * What the panel shows for one model role. An alias rather than a second
+ * declaration: the wire shape is the protocol's, and a local copy of it only
+ * typechecks against the desktop until one of the two gains a field.
+ */
+export type ProviderConfigInfo = ProviderConfigSummary;
 
 export type DesktopConnectionStatus = 'unknown' | 'connected' | 'offline';
 export type DesktopAuthStatus = 'unknown' | 'authorized' | 'unauthorized';
@@ -77,8 +68,12 @@ export interface ExtensionState {
   latestRunEvents: RunEvent[];
   latestAcceptedRun: AcceptedRunResponse | null;
   informalAudit: InformalAuditState | null;
-  formalizerOptions: FormalizerOption[] | null;
-  auxiliaryConfig: AuxiliaryConfigInfo | null;
+  formalizerConfig: ProviderConfigInfo | null;
+  /** Proof generation — the deepest reasoning and the largest share of spend. */
+  proposerConfig: ProviderConfigInfo | null;
+  auxiliaryConfig: ProviderConfigInfo | null;
+  // One OpenRouter key backs all three model roles.
+  hasOpenRouterKey: boolean;
   provision: ProvisionStateResponse | null;
   // Most recent provisioning log lines for live progress. Capped to keep
   // chrome.storage payloads small.
@@ -100,15 +95,15 @@ export type SidepanelToBackgroundMessage =
   | { type: 'sidepanel.getState' }
   | { type: 'sidepanel.refreshDesktop' }
   | { type: 'sidepanel.createProject' }
-  | { type: 'sidepanel.verifyClaim'; claimId: string }
+  | { type: 'sidepanel.verifyClaim'; claimId: string; mode?: VerificationMode }
   | { type: 'sidepanel.jumpToSource'; claimId: string }
   | { type: 'sidepanel.acknowledgeInformalAudit'; runId: string; reason: string }
+  | { type: 'sidepanel.requestPairing' }
   | { type: 'sidepanel.setBearerToken'; token: string }
   | { type: 'sidepanel.clearBearerToken' }
   | { type: 'sidepanel.startProvision'; force?: boolean }
-  | { type: 'sidepanel.switchFormalizer'; configId: string; optionKey: 'novita' | 'featherless' }
-  | { type: 'sidepanel.setNamedKey'; provider: string; key: string }
-  | { type: 'sidepanel.clearNamedKey'; provider: string };
+  | { type: 'sidepanel.setOpenRouterKey'; key: string }
+  | { type: 'sidepanel.clearOpenRouterKey' };
 
 export type BackgroundToContentMessage = { type: 'content.jumpToSource'; startOffset: number };
 

@@ -2,7 +2,10 @@ import { constants, type Dirent } from 'node:fs';
 import { access, readdir } from 'node:fs/promises';
 import { join, relative, sep } from 'node:path';
 
-const MAX_IMPORT_HINTS = 12;
+// The cap on collected hints is the cap the prompt will honour, so it is read
+// from the package that owns the prompt rather than restated here.
+import { MAX_IMPORT_HINTS } from '@lale/translator';
+export { MAX_IMPORT_HINTS };
 
 export type MathlibImportStatus = 'valid' | 'invalid' | 'missingOlean' | 'ignored';
 
@@ -244,7 +247,7 @@ function commonPrefixDepth(a: string, b: string): number {
   return depth;
 }
 
-function parseImportLine(line: string): { indent: string; modules: string[] } | null {
+export function parseImportLine(line: string): { indent: string; modules: string[] } | null {
   const match = /^(\s*)import\s+(.+)$/.exec(line);
   if (!match) return null;
 

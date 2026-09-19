@@ -2,3 +2,9 @@ packages:
   - "apps/*"
   - "packages/*"
 
+allowBuilds:
+  better-sqlite3: true
+  # Downloads the Electron binary the macOS shell is built against.
+  electron: true
+  esbuild: true
+  keytar: true

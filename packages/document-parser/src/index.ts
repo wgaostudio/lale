@@ -1,4 +1,6 @@
-export const PARSER_VERSION = '0.1.0';
+// 0.4.0 widened the fingerprint hash, so every value this module produces has
+// changed; claims accepted under 0.3.0 do not match and have to be rerun.
+export const PARSER_VERSION = '0.4.0';
 
 export type TheoremKind =
   | 'theorem'
@@ -35,6 +37,15 @@ export interface ParsedClaim {
   title: string | null;
   statement: string;
   body: string;
+  /**
+   * Standing hypotheses the claim inherits from the prose around it: the
+   * document's opening matter plus the lead paragraphs of every sectioning
+   * unit enclosing the claim. Papers state things like "let G be a finite
+   * simple graph" once, in running text, and every later environment relies on
+   * it; without this the claim body alone is a weaker statement than the author
+   * wrote.
+   */
+  ambientContext: string;
   proof: ParsedProof | null;
   dependencies: string[];
   dependents: string[];
@@ -99,6 +110,19 @@ export function parseLatexDocument(source: string): ParsedDocument {
   const packages = detectPackages(scanSource);
   const theoremDefinitions = detectTheoremDefinitions(scanSource);
   const claims = parseClaims(source);
+  attachAmbientContext(source, claims);
+  // Fingerprint the complete mathematical context after attaching inherited
+  // hypotheses. Both dependency reuse and extension staleness rely on this.
+  for (const claim of claims) {
+    claim.fingerprint = stableHash(JSON.stringify({
+      kind: claim.kind,
+      label: claim.label,
+      statement: claim.statement,
+      ambientContext: claim.ambientContext,
+      proof: claim.proof?.text ?? null,
+      dependencies: claim.dependencies,
+    }));
+  }
   const issues: DocumentIssue[] = [];
 
   addPackageIssues(packages, issues);
@@ -203,7 +227,7 @@ function parseClaims(source: string): ParsedClaim[] {
     const rawBody = source.slice(bodyStart, end.start);
     const title = match[2] ? match[2].slice(1, -1).trim() : null;
     const label = extractLabel(rawBody);
-    const proof = findAdjacentProof(source, scanSource, end.end);
+    const proof = findAdjacentProof(source, scanSource, end.end, lineStarts);
     const dependencyText = `${rawBody}\n${proof?.text ?? ''}`;
     const dependencies = unique(extractRefs(dependencyText).filter((ref) => ref !== label));
     const bodyEnd = proof?.endOffset ?? end.end;
@@ -217,6 +241,7 @@ function parseClaims(source: string): ParsedClaim[] {
       title,
       statement,
       body: rawBody.trim(),
+      ambientContext: '',
       proof,
       dependencies,
       dependents: [],
@@ -224,21 +249,152 @@ function parseClaims(source: string): ParsedClaim[] {
       endLine: lineForOffset(lineStarts, bodyEnd),
       startOffset: beginStart,
       endOffset: bodyEnd,
-      fingerprint: stableHash(
-        JSON.stringify({
-          kind: envName,
-          label,
-          statement,
-          proof: proof?.text ?? null,
-          dependencies,
-        }),
-      ),
+      fingerprint: '', // Assigned once ambient context has been attached.
     });
 
     BEGIN_RE.lastIndex = end.end;
   }
 
   return claims;
+}
+
+// ---------------------------------------------------------------------------
+// Ambient context (standing hypotheses carried by the surrounding prose)
+// ---------------------------------------------------------------------------
+
+interface SectionHeading {
+  level: number;
+  /** Offset of the `\\section`-style command itself. */
+  commandStart: number;
+  /** Offset just past the heading command. */
+  contentStart: number;
+}
+
+const SECTION_LEVELS: Record<string, number> = {
+  part: 0, chapter: 1, section: 2, subsection: 3, subsubsection: 4,
+};
+const SECTION_RE = /\\(part|chapter|section|subsection|subsubsection)\*?(?:\[[^\]]*\])?\{/g;
+
+// Per sectioning unit, and for the whole assembled context. A section lead is
+// normally a paragraph or two; these bounds only stop a pathological document
+// from crowding out the claim itself.
+const MAX_AMBIENT_PART_CHARS = 2000;
+const MAX_AMBIENT_CHARS = 8000;
+
+function attachAmbientContext(source: string, claims: ParsedClaim[]): void {
+  if (claims.length === 0) return;
+
+  const scanSource = maskLatexComments(source);
+  const headings = parseSectionHeadings(scanSource);
+  // Claim and proof spans are supplied to the model separately, as the target
+  // or as resolved dependencies; repeating them here would just cost tokens.
+  const claimSpans = claims.map((claim) => [claim.startOffset, claim.endOffset] as const);
+  const documentStart = documentBodyStart(scanSource);
+
+  for (const claim of claims) {
+    const parts: string[] = [];
+
+    // Opening matter: global conventions stated before any sectioning command.
+    const firstHeading = headings.find((heading) => heading.commandStart >= documentStart);
+    const preambleEnd = Math.min(firstHeading?.commandStart ?? source.length, claim.startOffset);
+    addAmbientPart(parts, source, documentStart, preambleEnd, claimSpans);
+
+    // Lead prose of every sectioning unit enclosing the claim, outermost first.
+    // Outermost matters most: "let G be a finite simple graph" is typically
+    // stated once under \section, while the claim sits under a \subsection.
+    // Each part opens with its own heading, so the model sees which unit the
+    // hypotheses belong to.
+    for (const heading of enclosingHeadings(headings, claim.startOffset)) {
+      const next = headings.find((other) => other.commandStart > heading.commandStart);
+      const end = Math.min(next?.commandStart ?? source.length, claim.startOffset);
+      addAmbientPart(parts, source, heading.commandStart, end, claimSpans);
+    }
+
+    claim.ambientContext = parts.join('\n\n').slice(0, MAX_AMBIENT_CHARS).trim();
+  }
+}
+
+function parseSectionHeadings(scanSource: string): SectionHeading[] {
+  const headings: SectionHeading[] = [];
+  SECTION_RE.lastIndex = 0;
+  let match: RegExpExecArray | null;
+  while ((match = SECTION_RE.exec(scanSource))) {
+    const level = SECTION_LEVELS[match[1] ?? ''];
+    if (level === undefined) continue;
+    const braced = readBracedGroup(scanSource, SECTION_RE.lastIndex - 1);
+    if (!braced) continue;
+    headings.push({ level, commandStart: match.index, contentStart: braced.end });
+    SECTION_RE.lastIndex = braced.end;
+  }
+  return headings;
+}
+
+/** The chain of sectioning units containing `offset`, outermost first. */
+function enclosingHeadings(headings: SectionHeading[], offset: number): SectionHeading[] {
+  const stack: SectionHeading[] = [];
+  for (const heading of headings) {
+    if (heading.contentStart > offset) break;
+    while (stack.length > 0 && stack[stack.length - 1]!.level >= heading.level) stack.pop();
+    stack.push(heading);
+  }
+  return stack;
+}
+
+function addAmbientPart(
+  parts: string[],
+  source: string,
+  start: number,
+  end: number,
+  claimSpans: ReadonlyArray<readonly [number, number]>,
+): void {
+  if (end <= start) return;
+  const text = cleanAmbientProse(removeSpans(source.slice(start, end), start, claimSpans));
+  if (text) parts.push(text.slice(0, MAX_AMBIENT_PART_CHARS));
+}
+
+/** Drops claim and proof environments that fall inside `[offset, offset + text.length)`. */
+function removeSpans(
+  text: string,
+  offset: number,
+  spans: ReadonlyArray<readonly [number, number]>,
+): string {
+  let result = '';
+  let cursor = 0;
+  for (const [start, end] of spans) {
+    const localStart = start - offset;
+    const localEnd = end - offset;
+    if (localEnd <= 0 || localStart >= text.length) continue;
+    result += text.slice(cursor, Math.max(cursor, localStart));
+    cursor = Math.max(cursor, localEnd);
+  }
+  return result + text.slice(cursor);
+}
+
+function cleanAmbientProse(source: string): string {
+  return maskLatexComments(source)
+    .replace(/\\label\{[^}]+\}/g, '')
+    .replace(/[ \t]+/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function documentBodyStart(scanSource: string): number {
+  const match = /\\begin\{document\}/.exec(scanSource);
+  return match ? match.index + match[0].length : 0;
+}
+
+function readBracedGroup(source: string, openIndex: number): { text: string; end: number } | null {
+  if (source[openIndex] !== '{') return null;
+  let depth = 0;
+  for (let i = openIndex; i < source.length; i++) {
+    const ch = source[i];
+    if (ch === '{') depth++;
+    else if (ch === '}') {
+      depth--;
+      if (depth === 0) return { text: source.slice(openIndex + 1, i), end: i + 1 };
+    }
+  }
+  return null;
 }
 
 function detectPackages(source: string): ParsedDocument['packages'] {
@@ -378,8 +534,12 @@ function findEnvironmentEnd(
   return null;
 }
 
-function findAdjacentProof(source: string, scanSource: string, from: number): ParsedProof | null {
-  const lineStarts = computeLineStarts(source);
+function findAdjacentProof(
+  source: string,
+  scanSource: string,
+  from: number,
+  lineStarts: number[],
+): ParsedProof | null {
   const next = scanSource.slice(from);
   const skipped = next.match(/^(?:\s|%[^\n]*(?:\n|$))*/)?.[0].length ?? 0;
   const beginOffset = from + skipped;
@@ -475,13 +635,25 @@ function lineForOffset(lineStarts: number[], offset: number): number {
   return lineStarts.length;
 }
 
+// FNV-1a, 128-bit, over UTF-16 code units. Everything else in the system
+// fingerprints with SHA-256, but this module runs in a content script as well as
+// on the desktop, where `node:crypto` does not exist and Web Crypto is async —
+// and `parseLatexDocument` is synchronous by contract. So: not SHA-256, but wide
+// enough to be a fingerprint. The 32-bit version this replaces gave 8 hex digits
+// for a value that decides whether a cached proof may be reused and whether a
+// dependent claim goes stale; birthday collisions arrive at ~2^16 distinct
+// claims, which is not a comfortable margin for either decision.
+const FNV_OFFSET_BASIS_128 = 0x6c62272e07bb014262b821756295c58dn;
+const FNV_PRIME_128 = 0x0000000001000000000000000000013bn;
+const UINT128_MASK = (1n << 128n) - 1n;
+
 function stableHash(input: string): string {
-  let hash = 2166136261;
+  let hash = FNV_OFFSET_BASIS_128;
   for (let index = 0; index < input.length; index++) {
-    hash ^= input.charCodeAt(index);
-    hash = Math.imul(hash, 16777619);
+    hash ^= BigInt(input.charCodeAt(index));
+    hash = (hash * FNV_PRIME_128) & UINT128_MASK;
   }
-  return (hash >>> 0).toString(16).padStart(8, '0');
+  return hash.toString(16).padStart(32, '0');
 }
 
 function unique(values: string[]): string[] {

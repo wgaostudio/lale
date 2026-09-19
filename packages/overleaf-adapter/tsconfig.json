@@ -1,11 +1,12 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "outDir": "dist",
-    "rootDir": "src",
-    "declaration": true,
-    "types": ["chrome"]
+    "noEmit": true,
+    "types": [
+      "chrome"
+    ]
   },
-  "include": ["src"]
+  "include": [
+    "src"
+  ]
 }
-

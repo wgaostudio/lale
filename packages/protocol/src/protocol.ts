@@ -7,7 +7,7 @@ export type ProtocolVersion = z.infer<typeof ProtocolVersion>;
 // Model roles & provider kinds
 // ---------------------------------------------------------------------------
 
-export const ModelRole = z.enum(['prover', 'formalizer', 'auxiliary']);
+export const ModelRole = z.enum(['proposer', 'formalizer', 'auxiliary']);
 export type ModelRole = z.infer<typeof ModelRole>;
 
 export const ProviderKind = z.enum(['openrouter', 'openaiCompatible', 'local', 'manual']);
@@ -28,7 +28,8 @@ export const RunPhase = z.enum([
   'formalizeStatement',
   'faithfulness',
   'freezeHeader',
-  'proverAttempt',
+  'proofSteps',
+  'proposerAttempt',
   'finalGate',
   'complete',
 ]);
@@ -38,13 +39,15 @@ export type RunPhase = z.infer<typeof RunPhase>;
 // Verification outcome
 // ---------------------------------------------------------------------------
 
+// Every member here is produced by the pipeline and documented in
+// docs/tester-quickstart.md. `claimContradicted` and `proofContradicted` used to
+// sit in this list and were never once written: nothing in the pipeline can
+// establish that a claim is false, only that no proposal of it was accepted.
 export const VerificationOutcome = z.enum([
   'formalized',
   'verified',
   'malformedClaim',
   'malformedProof',
-  'claimContradicted',
-  'proofContradicted',
   'proofIncomplete',
   'proofDoesNotSupportClaim',
   'formalizationUnfaithful',
@@ -91,7 +94,6 @@ export const ExtensionClaimStatus = z.enum([
   'stale',
   'blocked',
   'failed',
-  'timedOut',
   'checking',
 ]);
 export type ExtensionClaimStatus = z.infer<typeof ExtensionClaimStatus>;
@@ -102,6 +104,8 @@ export type ExtensionClaimStatus = z.infer<typeof ExtensionClaimStatus>;
 
 export const HealthResponse = z.object({
   protocolVersion: ProtocolVersion,
+  /** Desktop build, so a report from a tester names the version it came from. */
+  version: z.string().default('0.0.0-dev'),
   status: z.enum(['ok', 'degraded', 'unavailable']),
   lean: z.object({
     available: z.boolean(),
@@ -133,6 +137,20 @@ export type OverleafDocumentSnapshot = z.infer<typeof OverleafDocumentSnapshot>;
 // Verification request / response
 // ---------------------------------------------------------------------------
 
+/**
+ * - `full`: statement formalization, then PROOF GENERATION — the model writes a
+ *   whole Lean proof and the kernel adjudicates it. A pass means the theorem is
+ *   true; the author's own argument is not audited.
+ * - `formalizeOnly`: stop after formalization and the faithfulness checks —
+ *   cheap, and enough to surface an ambiguous statement.
+ * - `proofSkeleton`: PROOF FORMALIZATION — split the author's proof into the
+ *   steps it argues and state each in Lean under the theorem's hypotheses, then
+ *   prove them. This audits the argument rather than the conclusion, so a gap
+ *   localises to a step.
+ */
+export const VerificationMode = z.enum(['full', 'formalizeOnly', 'proofSkeleton']);
+export type VerificationMode = z.infer<typeof VerificationMode>;
+
 export const VerificationRequest = z.object({
   protocolVersion: ProtocolVersion,
   requestId: z.string(),
@@ -141,6 +159,7 @@ export const VerificationRequest = z.object({
   snapshot: OverleafDocumentSnapshot,
   parsedDocumentFingerprint: z.string(),
   parserVersion: z.string(),
+  mode: VerificationMode.default('full'),
 });
 export type VerificationRequest = z.infer<typeof VerificationRequest>;
 
@@ -212,6 +231,7 @@ export type DesktopProject = z.infer<typeof DesktopProject>;
 
 export const DesktopClaimStatus = z.object({
   claimId: z.string(),
+  claimFingerprint: z.string().nullable().default(null),
   label: z.string().nullable(),
   kind: z.string(),
   status: ExtensionClaimStatus,
@@ -247,8 +267,6 @@ export const CreateProjectRequest = z.object({
   overleafUrl: z.string().url().nullable(),
   documentFingerprint: z.string(),
   name: z.string(),
-  leanVersion: z.string().optional(),
-  mathlibRevision: z.string().optional(),
 });
 export type CreateProjectRequest = z.infer<typeof CreateProjectRequest>;
 
@@ -256,15 +274,26 @@ export type CreateProjectRequest = z.infer<typeof CreateProjectRequest>;
 // Provider config (managed by desktop, surfaced to extension for display only)
 // ---------------------------------------------------------------------------
 
+/** What the panel shows for one model role. Every role reports the same shape. */
 export const ProviderConfigSummary = z.object({
   providerConfigId: z.string(),
-  role: ModelRole,
-  providerKind: ProviderKind,
+  /** Display name of the provider, e.g. `OpenRouter`. */
+  provider: z.string(),
   modelId: z.string(),
   baseUrl: z.string().nullable(),
-  hasKey: z.boolean(),
+  reasoningEffort: z.string().nullable(),
 });
 export type ProviderConfigSummary = z.infer<typeof ProviderConfigSummary>;
+
+// GET /v1/provider-configs. One stored OpenRouter key backs all three roles, so
+// key presence is a single flag rather than a field on each summary.
+export const ProviderConfigsResponse = z.object({
+  formalizerConfig: ProviderConfigSummary.nullable(),
+  proposerConfig: ProviderConfigSummary.nullable(),
+  auxiliaryConfig: ProviderConfigSummary.nullable(),
+  hasKey: z.boolean(),
+});
+export type ProviderConfigsResponse = z.infer<typeof ProviderConfigsResponse>;
 
 // ---------------------------------------------------------------------------
 // Lean + Mathlib provisioning (§4 backend spec)
@@ -327,21 +356,3 @@ export const ProvisionStateResponse = z.object({
   projectReady: z.boolean(),
 });
 export type ProvisionStateResponse = z.infer<typeof ProvisionStateResponse>;
-
-// ---------------------------------------------------------------------------
-// Legacy — kept for extension compatibility during migration
-// ---------------------------------------------------------------------------
-
-/** @deprecated Use AcceptedRunResponse + SSE. Remove once extension is updated. */
-export const VerificationResponse = z.object({
-  protocolVersion: ProtocolVersion,
-  requestId: z.string(),
-  claimId: z.string(),
-  status: z.enum(['accepted', 'verified', 'failed']),
-  leanCode: z.string().nullable(),
-  diagnostics: z.array(z.string()),
-  failureCategory: z
-    .enum(['parseFailure', 'unknownIdentifier', 'typeMismatch', 'proofFailure', 'timeout'])
-    .nullable(),
-});
-export type VerificationResponse = z.infer<typeof VerificationResponse>;

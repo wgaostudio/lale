@@ -1,0 +1,434 @@
+/*
+ * Side-panel layout. Anything reusable belongs in @lale/ui; this file is only
+ * for shapes specific to this surface (the claim list, the dependency graph,
+ * the advisory block).
+ */
+
+#app {
+  min-height: 100vh;
+  padding: var(--lale-space-5) var(--lale-space-5) var(--lale-space-7);
+}
+
+.empty {
+  padding: var(--lale-space-6) 0;
+}
+
+/* --- Top bar ----------------------------------------------------------- */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--lale-space-4);
+  min-height: 26px;
+}
+
+.topbar-title {
+  display: flex;
+  align-items: center;
+  gap: var(--lale-space-3);
+  min-width: 0;
+}
+
+.topbar-heading {
+  display: flex;
+  align-items: center;
+  flex: none;
+  gap: var(--lale-space-3);
+}
+
+.topbar-logo,
+.topbar-mark {
+  display: block;
+  flex: none;
+  height: 24px;
+}
+
+.topbar-logo { width: 69px; }
+.topbar-mark { width: 24px; }
+
+.topbar-sep,
+.topbar-subtitle {
+  color: var(--lale-ink-muted);
+  font-size: var(--lale-text-sm);
+}
+
+.topbar-actions {
+  display: flex;
+  flex: none;
+  gap: var(--lale-space-1);
+}
+
+/* --- Status strip ------------------------------------------------------ */
+
+.status-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--lale-space-3) var(--lale-space-5);
+  padding: var(--lale-space-4) 0;
+}
+
+/* --- Callout -----------------------------------------------------------
+ * Square, with a single colour bar on the leading edge — the one place a
+ * status colour touches a surface rather than a glyph. */
+
+.callout {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--lale-space-4);
+  margin-bottom: var(--lale-space-4);
+  padding: var(--lale-space-4) var(--lale-space-5);
+  background: var(--lale-surface-sunken);
+  border-left: 2px solid var(--lale-idle-mark);
+}
+
+.callout[data-tone='warn'] {
+  background: var(--lale-warn-wash);
+  border-left-color: var(--lale-warn-mark);
+}
+
+.callout[data-tone='bad'] {
+  background: var(--lale-bad-wash);
+  border-left-color: var(--lale-bad-mark);
+}
+
+.callout-body {
+  min-width: 0;
+}
+
+.callout-title {
+  display: block;
+  font-size: var(--lale-text-base);
+  font-weight: var(--lale-weight-medium);
+  letter-spacing: var(--lale-track-tight);
+}
+
+.callout .lale-button {
+  flex: none;
+}
+
+/* --- Claims ------------------------------------------------------------ */
+
+.claim-list {
+  display: flex;
+  flex-direction: column;
+}
+
+/* The environment name rides alongside the label in mono rather than in its
+ * own badge — one less box per row. */
+.claim-kind {
+  color: var(--lale-ink-faint);
+  font-family: var(--lale-font-mono);
+  font-size: var(--lale-text-xs);
+  font-weight: var(--lale-weight-normal);
+  letter-spacing: 0;
+}
+
+.claim-meta {
+  color: var(--lale-ink-faint);
+}
+
+/* --- Detail ------------------------------------------------------------ */
+
+.detail-meta {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--lale-space-3) var(--lale-space-4);
+  padding-top: var(--lale-space-4);
+}
+
+.detail-stage {
+  margin-top: var(--lale-space-2);
+}
+
+.detail-actions {
+  padding: var(--lale-space-5) 0 var(--lale-space-2);
+}
+
+.actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--lale-space-3);
+  margin-top: var(--lale-space-4);
+}
+
+/* --- LaTeX -------------------------------------------------------------- */
+
+.latex-block {
+  font-size: var(--lale-text-md);
+  line-height: 1.55;
+  overflow-wrap: anywhere;
+}
+
+.latex-block .katex-display {
+  margin: var(--lale-space-4) 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+/* KaTeX defaults to a larger optical size than the surrounding row text. */
+.latex-inline .katex {
+  font-size: 1em;
+}
+
+/* --- Dependency graph ---------------------------------------------------
+ * One claim per row with a lane gutter on the left, so the graph is exactly as
+ * wide as the panel and only ever scrolls vertically. Nothing here scales, so
+ * label text always renders at its authored size. */
+
+.graph-rows {
+  display: flex;
+  flex-direction: column;
+  margin: 0 calc(-1 * var(--lale-space-2));
+}
+
+.graph-row {
+  display: flex;
+  align-items: center;
+  gap: var(--lale-space-3);
+  width: 100%;
+  padding: 0 var(--lale-space-2);
+  border: 0;
+  border-radius: var(--lale-radius-none);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.graph-row:hover {
+  background: var(--lale-surface-sunken);
+}
+
+.graph-row[data-selected='true'] {
+  background: var(--lale-surface-sunken);
+  box-shadow: inset 2px 0 0 var(--lale-ink);
+}
+
+.graph-gutter {
+  flex: none;
+  overflow: visible;
+}
+
+.graph-gutter line,
+.graph-gutter path {
+  fill: none;
+  stroke: var(--lale-line-strong);
+  stroke-width: 1.25;
+}
+
+.graph-node-dot {
+  fill: var(--lale-idle-mark);
+}
+
+.graph-node-dot[data-tone='ok'] { fill: var(--lale-ok-mark); }
+.graph-node-dot[data-tone='warn'] { fill: var(--lale-warn-mark); }
+.graph-node-dot[data-tone='bad'] { fill: var(--lale-bad-mark); }
+
+.graph-row[data-running='true'] .graph-node-dot {
+  animation: lale-pulse 1.4s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .graph-row[data-running='true'] .graph-node-dot { animation: none; }
+}
+
+.graph-row-label {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--lale-font-mono);
+  font-size: var(--lale-text-sm);
+}
+
+.graph-row-kind {
+  flex: none;
+  color: var(--lale-ink-faint);
+  font-size: var(--lale-text-xs);
+  letter-spacing: var(--lale-track-label);
+  text-transform: uppercase;
+}
+
+.graph-note {
+  margin-top: var(--lale-space-4);
+}
+
+/* --- Upstream plan ------------------------------------------------------ */
+
+.plan-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.plan-row {
+  display: grid;
+  grid-template-columns: 20px minmax(0, 1fr);
+  align-items: baseline;
+  gap: var(--lale-space-2) var(--lale-space-4);
+  width: 100%;
+  padding: var(--lale-space-4) var(--lale-space-2);
+  border: 0;
+  border-top: 1px solid var(--lale-line);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+}
+
+.plan-row:first-child {
+  border-top: 0;
+}
+
+button.plan-row {
+  cursor: pointer;
+}
+
+button.plan-row:hover {
+  background: var(--lale-surface-sunken);
+}
+
+.plan-row[data-unresolved='true'] {
+  background: var(--lale-bad-wash);
+}
+
+.plan-order {
+  color: var(--lale-ink-faint);
+  font-size: var(--lale-text-xs);
+}
+
+.plan-main {
+  min-width: 0;
+}
+
+.plan-title {
+  display: block;
+  font-size: var(--lale-text-base);
+  font-weight: var(--lale-weight-medium);
+  letter-spacing: var(--lale-track-tight);
+}
+
+.plan-sub {
+  display: block;
+  margin-top: var(--lale-space-1);
+  color: var(--lale-ink-muted);
+  font-size: var(--lale-text-sm);
+}
+
+.plan-row > .lale-status {
+  grid-column: 2;
+}
+
+/* --- Lists -------------------------------------------------------------- */
+
+.finding-list,
+.label-list {
+  margin: 0;
+  padding-left: var(--lale-space-6);
+}
+
+.finding-list li,
+.label-list li {
+  margin: var(--lale-space-2) 0;
+}
+
+.finding-list li[data-severity='error'] {
+  color: var(--lale-bad-ink);
+}
+
+.finding-list li[data-severity='warning'] {
+  color: var(--lale-warn-ink);
+}
+
+/* --- Advisory ----------------------------------------------------------- */
+
+.advisory-head {
+  display: flex;
+  align-items: center;
+  gap: var(--lale-space-4);
+  margin-bottom: var(--lale-space-4);
+}
+
+.advisory-note {
+  margin: var(--lale-space-4) 0 var(--lale-space-5);
+}
+
+.advisory-override {
+  display: grid;
+  gap: var(--lale-space-3);
+  margin-top: var(--lale-space-4);
+  padding-top: var(--lale-space-4);
+  border-top: 1px solid var(--lale-line);
+}
+
+.advisory-ack {
+  margin-top: var(--lale-space-4);
+  padding-top: var(--lale-space-4);
+  border-top: 1px solid var(--lale-line);
+}
+
+.advisory-ack-reason {
+  margin: var(--lale-space-2) 0;
+  font-size: var(--lale-text-base);
+}
+
+/* --- Settings ----------------------------------------------------------- */
+
+.key-input-row {
+  display: flex;
+  align-items: center;
+  gap: var(--lale-space-3);
+  margin-bottom: var(--lale-space-6);
+}
+
+.key-input-row .lale-input {
+  flex: 1;
+  min-width: 0;
+}
+
+.key-input-row .lale-button {
+  flex: none;
+}
+
+.role-row {
+  padding-top: var(--lale-space-5);
+  margin-top: var(--lale-space-5);
+  border-top: 1px solid var(--lale-line);
+}
+
+.role-row:first-of-type {
+  margin-top: 0;
+}
+
+.role-row .lale-muted {
+  margin-top: var(--lale-space-3);
+}
+
+.provision-log-label {
+  margin: var(--lale-space-5) 0 var(--lale-space-3);
+}
+
+.provision-log,
+.run-log {
+  max-height: 200px;
+  overflow: auto;
+  color: var(--lale-ink-soft);
+}
+
+.snippet code {
+  font-size: var(--lale-text-xs);
+}
+
+.error-text {
+  color: var(--lale-bad-ink);
+  font-size: var(--lale-text-sm);
+  margin-top: var(--lale-space-3);
+}
+
+.graph-row-bundled {
+  flex: none;
+  color: var(--lale-ink-muted);
+  font-family: var(--lale-font-mono);
+  font-size: var(--lale-text-xs);
+}

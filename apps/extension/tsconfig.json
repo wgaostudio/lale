@@ -1,10 +1,16 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "types": ["chrome"],
+    "types": [
+      "chrome"
+    ],
     "jsx": "react-jsx",
     "noEmit": true
   },
-  "include": ["src", "manifest.config.ts", "vite.config.ts"]
+  "include": [
+    "src",
+    "manifest.config.ts",
+    "vite.config.ts",
+    "package.json"
+  ]
 }
-

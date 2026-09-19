@@ -1,0 +1,91 @@
+/*
+ * @lale/ui design tokens
+ *
+ * Derived from the Alta Daily brand language (NB International Pro grotesque,
+ * a near-monochrome grey ramp, colour reserved for meaning, radius only ever 0
+ * or a full pill) retuned for a dense developer tool rather than an editorial
+ * consumer app: smaller type scale, tighter spacing, hairline rules instead of
+ * cards.
+ *
+ * Plain CSS on purpose — the desktop GUI can consume this file as-is without
+ * pulling in React.
+ */
+
+:root {
+  /* --- Neutrals -------------------------------------------------------
+   * The entire UI is built from these. If something is not communicating
+   * verification status, it is grey. */
+  --lale-ink: #1a1a1a;
+  --lale-ink-soft: #444444;
+  --lale-ink-muted: #6e7177;
+  --lale-ink-faint: #b8b8b8;
+
+  --lale-surface: #ffffff;
+  --lale-surface-sunken: #f7f8f8;
+  --lale-surface-raised: #f2f2f2;
+
+  --lale-line: #eeeff1;
+  --lale-line-strong: #dcdee1;
+
+  /* --- Status ---------------------------------------------------------
+   * The only colour in the system. Each has a vivid `mark` for glyphs and
+   * dots, and a darkened `ink` that clears 4.5:1 on white for text; the two
+   * that tint a whole surface also carry a `wash`. */
+  --lale-ok-mark: #4cb782;
+  --lale-ok-ink: #2c7a53;
+
+  --lale-warn-mark: #f2c94c;
+  --lale-warn-ink: #7a5e10;
+  --lale-warn-wash: #fdf8e9;
+
+  --lale-bad-mark: #eb5757;
+  --lale-bad-ink: #b3342c;
+  --lale-bad-wash: #fdf2f1;
+
+  /* Neutral/pending status, for claims not yet attempted. Text in this tone is
+   * `--lale-ink-muted`, which is what a status reverts to without a tone. */
+  --lale-idle-mark: #b8b8b8;
+
+  /* --- Type -----------------------------------------------------------
+   * Helvetica Neue stands in for NB International Pro, which is licensed.
+   * Swap in Geist / NB and the rest of the system holds. */
+  --lale-font-sans: 'Helvetica Neue', Inter, ui-sans-serif, system-ui,
+    -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Arial, sans-serif;
+  --lale-font-mono: 'SFMono-Regular', 'Geist Mono', Menlo, Consolas,
+    'Liberation Mono', monospace;
+
+  --lale-text-xs: 10px;
+  --lale-text-sm: 11px;
+  --lale-text-base: 12px;
+  --lale-text-md: 13px;
+  --lale-text-lg: 15px;
+
+  --lale-leading: 1.45;
+
+  /* Tight on display sizes, wide on small uppercase labels — the single
+   * typographic move that does most of the editorial work. */
+  --lale-track-tight: -0.02em;
+  --lale-track-normal: 0;
+  --lale-track-label: 0.08em;
+
+  --lale-weight-normal: 400;
+  --lale-weight-medium: 500;
+  --lale-weight-bold: 700;
+
+  /* --- Space ---------------------------------------------------------- */
+  --lale-space-1: 2px;
+  --lale-space-2: 4px;
+  --lale-space-3: 6px;
+  --lale-space-4: 8px;
+  --lale-space-5: 12px;
+  --lale-space-6: 16px;
+  --lale-space-7: 24px;
+
+  /* --- Shape ----------------------------------------------------------
+   * Deliberately only two values. Panels and rows are square; badges and
+   * buttons are pills. Nothing is 6px-rounded. */
+  --lale-radius-none: 0;
+  --lale-radius-pill: 9999px;
+
+  --lale-focus-ring: 0 0 0 2px var(--lale-surface), 0 0 0 4px var(--lale-ink);
+}

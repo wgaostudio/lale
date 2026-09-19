@@ -2,13 +2,14 @@ import Database from 'better-sqlite3';
 import { join } from 'node:path';
 import { mkdirSync } from 'node:fs';
 import { homedir } from 'node:os';
+import type { ModelRole, VerificationMode } from '@lale/protocol';
 
 // ---------------------------------------------------------------------------
 // DB path
 // ---------------------------------------------------------------------------
 
 export function defaultDbPath(): string {
-  const dir = join(homedir(), '.lale');
+  const dir = process.env['LALE_DATA_DIR'] ?? join(homedir(), '.lale');
   mkdirSync(dir, { recursive: true });
   return join(dir, 'lale.db');
 }
@@ -33,11 +34,11 @@ CREATE TABLE IF NOT EXISTS projects (
   settingsJson      TEXT NOT NULL DEFAULT '{}'
 );
 
--- §10.2  (three rows per project: prover, formalizer, auxiliary)
+-- §10.2  (three rows per project: proposer, formalizer, auxiliary)
 CREATE TABLE IF NOT EXISTS model_provider_configs (
   providerConfigId TEXT PRIMARY KEY,
   projectId        TEXT REFERENCES projects(projectId),
-  role             TEXT NOT NULL CHECK (role IN ('prover','formalizer','auxiliary')),
+  role             TEXT NOT NULL CHECK (role IN ('proposer','formalizer','auxiliary')),
   providerKind     TEXT NOT NULL CHECK (providerKind IN ('openrouter','openaiCompatible','local','manual')),
   baseUrl          TEXT,
   modelId          TEXT NOT NULL,
@@ -92,18 +93,11 @@ CREATE TABLE IF NOT EXISTS claim_revisions (
   dependenciesJson TEXT NOT NULL DEFAULT '[]'
 );
 
--- §10.6
-CREATE TABLE IF NOT EXISTS dependency_edges (
-  edgeId               TEXT PRIMARY KEY,
-  snapshotId           TEXT NOT NULL REFERENCES document_snapshots(snapshotId),
-  fromClaimRevisionId  TEXT NOT NULL REFERENCES claim_revisions(claimRevisionId),
-  toClaimRevisionId    TEXT NOT NULL REFERENCES claim_revisions(claimRevisionId),
-  label                TEXT,
-  kind                 TEXT NOT NULL CHECK (kind IN ('explicitRef','context','external')),
-  resolutionStatus     TEXT NOT NULL CHECK (resolutionStatus IN ('resolved','unresolved','ambiguous')),
-  sourceSpanJson       TEXT,
-  trustStatus          TEXT NOT NULL DEFAULT 'unverified'
-);
+-- §10.6 dependency_edges is deliberately absent. Staleness propagation reads
+-- the parser's resolved edges out of document_snapshots.parsedDocumentJson,
+-- which needs no rows of its own; see propagateStaleness. Databases from
+-- earlier builds keep an empty copy of the table, which nothing reads and
+-- which is left in place rather than dropped.
 
 -- §10.7 — three nullable config ID columns (updated from single modelProviderConfigId)
 CREATE TABLE IF NOT EXISTS audit_runs (
@@ -113,6 +107,7 @@ CREATE TABLE IF NOT EXISTS audit_runs (
   targetClaimRevisionId TEXT REFERENCES claim_revisions(claimRevisionId),
   requestId             TEXT NOT NULL,
   status                TEXT NOT NULL CHECK (status IN ('queued','running','paused','cancelled','finished')),
+  mode                  TEXT NOT NULL DEFAULT 'full' CHECK (mode IN ('full','formalizeOnly','proofSkeleton')),
   phase                 TEXT,
   startedAt             TEXT NOT NULL,
   finishedAt            TEXT,
@@ -120,7 +115,7 @@ CREATE TABLE IF NOT EXISTS audit_runs (
   durationMs            INTEGER,
   leanVersion           TEXT,
   mathlibRevision       TEXT,
-  proverConfigId        TEXT REFERENCES model_provider_configs(providerConfigId),
+  proposerConfigId      TEXT REFERENCES model_provider_configs(providerConfigId),
   formalizerConfigId    TEXT REFERENCES model_provider_configs(providerConfigId),
   auxiliaryConfigId     TEXT REFERENCES model_provider_configs(providerConfigId)
 );
@@ -264,9 +259,96 @@ CREATE TABLE IF NOT EXISTS install_config (
 export function openDb(dbPath?: string): Database.Database {
   const path = dbPath ?? defaultDbPath();
   const db = new Database(path);
-  db.exec(SCHEMA);
-  migrateAuditRunPausedStatus(db);
-  return db;
+  try {
+    db.exec(SCHEMA);
+    // Order matters. The paused-status rebuild copies audit_runs column by
+    // column, so every column it must preserve has to exist first: the legacy
+    // rename supplies proposerConfigId, and the mode migration supplies mode.
+    // Rebuilding before either one silently drops that column's data.
+    migrateProverToProposer(db);
+    migrateAuditRunMode(db);
+    migrateAuditRunPausedStatus(db);
+    return db;
+  } catch (error) {
+    db.close();
+    throw error;
+  }
+}
+
+function migrateAuditRunMode(db: Database.Database): void {
+  const columns = db.prepare('PRAGMA table_info(audit_runs)').all() as Array<{ name: string }>;
+  if (columns.some((column) => column.name === 'mode')) return;
+  db.exec(`ALTER TABLE audit_runs ADD COLUMN mode TEXT NOT NULL DEFAULT 'full'
+    CHECK (mode IN ('full','formalizeOnly','proofSkeleton'))`);
+}
+
+/**
+ * Renames the `prover` role to `proposer`. The model does not prove anything —
+ * it proposes a candidate proof and Lean's kernel decides — and the old name put
+ * that authority in the wrong place. Installs predating the rename carry rows, a
+ * column and stored phase values under the old spelling.
+ */
+// The pre-rename spellings, written once and only here. A blanket rename across
+// the tree would otherwise rewrite this migration's "from" side into the new
+// spelling and silently turn it into a no-op. (That happened.)
+const LEGACY_ROLE = 'prover';
+const LEGACY_PHASE = 'proverAttempt';
+const LEGACY_CONFIG_COLUMN = 'proverConfigId';
+
+function migrateProverToProposer(db: Database.Database): void {
+  const configSchema = db
+    .prepare("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'model_provider_configs'")
+    .get() as { sql: string } | undefined;
+  const needsRoleRebuild = configSchema?.sql.includes(`'${LEGACY_ROLE}'`) ?? false;
+  const columns = db.prepare('PRAGMA table_info(audit_runs)').all() as Array<{ name: string }>;
+  const needsColumnRename = columns.some((column) => column.name === LEGACY_CONFIG_COLUMN);
+
+  if (!needsRoleRebuild && !needsColumnRename) return;
+
+  const foreignKeys = (db.pragma('foreign_keys', { simple: true }) as number) === 1;
+  db.pragma('foreign_keys = OFF');
+  try {
+    db.transaction(() => {
+      if (needsColumnRename) {
+        db.exec(`ALTER TABLE audit_runs RENAME COLUMN ${LEGACY_CONFIG_COLUMN} TO proposerConfigId;`);
+      }
+      if (needsRoleRebuild) {
+        db.exec(`
+          DROP TABLE IF EXISTS model_provider_configs_new;
+          CREATE TABLE model_provider_configs_new (
+            providerConfigId TEXT PRIMARY KEY,
+            projectId        TEXT REFERENCES projects(projectId),
+            role             TEXT NOT NULL CHECK (role IN ('proposer','formalizer','auxiliary')),
+            providerKind     TEXT NOT NULL CHECK (providerKind IN ('openrouter','openaiCompatible','local','manual')),
+            baseUrl          TEXT,
+            modelId          TEXT NOT NULL,
+            reasoningEffort  TEXT,
+            temperature      REAL,
+            maxTokens        INTEGER,
+            apiKeyRef        TEXT,
+            createdAt        TEXT NOT NULL,
+            updatedAt        TEXT NOT NULL
+          );
+          INSERT INTO model_provider_configs_new
+            (providerConfigId, projectId, role, providerKind, baseUrl, modelId,
+             reasoningEffort, temperature, maxTokens, apiKeyRef, createdAt, updatedAt)
+          SELECT providerConfigId, projectId,
+                 CASE role WHEN '${LEGACY_ROLE}' THEN 'proposer' ELSE role END,
+                 providerKind, baseUrl, modelId,
+                 reasoningEffort, temperature, maxTokens, apiKeyRef, createdAt, updatedAt
+          FROM model_provider_configs;
+          DROP TABLE model_provider_configs;
+          ALTER TABLE model_provider_configs_new RENAME TO model_provider_configs;
+        `);
+      }
+      // Stored phase values are read back by the extension's phase labels.
+      for (const table of ['audit_runs', 'run_events']) {
+        db.prepare(`UPDATE ${table} SET phase = ? WHERE phase = ?`).run('proposerAttempt', LEGACY_PHASE);
+      }
+    })();
+  } finally {
+    db.pragma(`foreign_keys = ${foreignKeys ? 'ON' : 'OFF'}`);
+  }
 }
 
 function migrateAuditRunPausedStatus(db: Database.Database): void {
@@ -290,6 +372,7 @@ function migrateAuditRunPausedStatus(db: Database.Database): void {
           targetClaimRevisionId TEXT REFERENCES claim_revisions(claimRevisionId),
           requestId             TEXT NOT NULL,
           status                TEXT NOT NULL CHECK (status IN ('queued','running','paused','cancelled','finished')),
+          mode                  TEXT NOT NULL DEFAULT 'full' CHECK (mode IN ('full','formalizeOnly','proofSkeleton')),
           phase                 TEXT,
           startedAt             TEXT NOT NULL,
           finishedAt            TEXT,
@@ -297,18 +380,18 @@ function migrateAuditRunPausedStatus(db: Database.Database): void {
           durationMs            INTEGER,
           leanVersion           TEXT,
           mathlibRevision       TEXT,
-          proverConfigId        TEXT REFERENCES model_provider_configs(providerConfigId),
+          proposerConfigId      TEXT REFERENCES model_provider_configs(providerConfigId),
           formalizerConfigId    TEXT REFERENCES model_provider_configs(providerConfigId),
           auxiliaryConfigId     TEXT REFERENCES model_provider_configs(providerConfigId)
         );
         INSERT INTO audit_runs_new
-          (auditRunId, projectId, snapshotId, targetClaimRevisionId, requestId, status, phase,
+          (auditRunId, projectId, snapshotId, targetClaimRevisionId, requestId, status, mode, phase,
            startedAt, finishedAt, outcome, durationMs, leanVersion, mathlibRevision,
-           proverConfigId, formalizerConfigId, auxiliaryConfigId)
+           proposerConfigId, formalizerConfigId, auxiliaryConfigId)
         SELECT
-          auditRunId, projectId, snapshotId, targetClaimRevisionId, requestId, status, phase,
+          auditRunId, projectId, snapshotId, targetClaimRevisionId, requestId, status, mode, phase,
           startedAt, finishedAt, outcome, durationMs, leanVersion, mathlibRevision,
-          proverConfigId, formalizerConfigId, auxiliaryConfigId
+          proposerConfigId, formalizerConfigId, auxiliaryConfigId
         FROM audit_runs;
         DROP TABLE audit_runs;
         ALTER TABLE audit_runs_new RENAME TO audit_runs;
@@ -337,7 +420,8 @@ export interface ProjectRow {
 export interface ProviderConfigRow {
   providerConfigId: string;
   projectId: string | null;
-  role: 'prover' | 'formalizer' | 'auxiliary';
+  // Same list as the CHECK constraint above, and as the protocol's enum.
+  role: ModelRole;
   providerKind: string;
   baseUrl: string | null;
   modelId: string;
@@ -356,6 +440,7 @@ export interface AuditRunRow {
   targetClaimRevisionId: string | null;
   requestId: string;
   status: string;
+  mode: VerificationMode;
   phase: string | null;
   startedAt: string;
   finishedAt: string | null;
@@ -363,7 +448,7 @@ export interface AuditRunRow {
   durationMs: number | null;
   leanVersion: string | null;
   mathlibRevision: string | null;
-  proverConfigId: string | null;
+  proposerConfigId: string | null;
   formalizerConfigId: string | null;
   auxiliaryConfigId: string | null;
 }

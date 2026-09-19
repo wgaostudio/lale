@@ -1,0 +1,20 @@
+[
+  {
+    "id": "nat-add-zero",
+    "claimId": "lem:add-zero",
+    "latex": "\\begin{lemma}\\label{lem:add-zero} For every natural number $n$, $n + 0 = n$.\\end{lemma}\n\\begin{proof}By the definition of addition.\\end{proof}",
+    "expected": ["verified"]
+  },
+  {
+    "id": "nat-zero-add",
+    "claimId": "lem:zero-add",
+    "latex": "\\begin{lemma}\\label{lem:zero-add} For every natural number $n$, $0 + n = n$.\\end{lemma}\n\\begin{proof}By induction on $n$.\\end{proof}",
+    "expected": ["verified"]
+  },
+  {
+    "id": "false-zero-one",
+    "claimId": "thm:false",
+    "latex": "\\begin{theorem}\\label{thm:false} In the natural numbers, $0 = 1$.\\end{theorem}\n\\begin{proof}This is immediate.\\end{proof}",
+    "expected": ["proofIncomplete"]
+  }
+]

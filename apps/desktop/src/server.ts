@@ -9,28 +9,41 @@ import { LeanCheckCache } from '@lale/cache';
 import {
   AcceptedRunResponse,
   AcceptedProvisionResponse,
+  AuditRunStatus,
   CreateProjectRequest,
   ExtensionClaimStatus,
+  FaithfulnessVerdict,
   HealthResponse,
   ProjectLookupRequest,
   ProjectLookupResponse,
+  ProviderConfigsResponse,
   ProvisionRequest,
   RunPhase,
+  RunResult,
   VerificationRequest,
   VerificationOutcome,
 } from '@lale/protocol';
+import type { ProviderConfigSummary } from '@lale/protocol';
 import { parseLatexDocument } from '@lale/document-parser';
 import { openDb } from './db.js';
 import type { ProjectRow, AuditRunRow, ProviderConfigRow } from './db.js';
-import { getOrCreateToken, checkAuth, isOriginAllowed, sendUnauthorized, sendForbidden } from './auth.js';
+import {
+  getOrCreateToken, checkAuth, isOriginAllowed, sendUnauthorized, sendForbidden,
+  readPairedOrigins, recordPairedOrigin, normalizeOrigin, setServicePort, DEFAULT_PORT,
+} from './auth.js';
+import { Logger } from './logging.js';
+import { PairingBroker, PairingAlreadyPendingError, approveFromTerminal } from './pairing.js';
 import {
   acknowledgeInformalAudit,
+  DEFAULT_TOKEN_BUDGET_CAP,
+  DEFAULT_WALL_CLOCK_CAP_MS,
   InformalAuditNotFoundError,
   runPipeline,
   subscribeSse,
 } from './pipeline/run.js';
 import { clearMathlibImportIndexCache } from './pipeline/mathlib-index.js';
 import {
+  setProvisionLogSink,
   startProvision,
   subscribeProvisionSse,
   getProvisionState,
@@ -42,85 +55,110 @@ import {
 } from './provisioning.js';
 import {
   DEFAULT_OPENROUTER_BASE_URL,
-  DEFAULT_NOVITA_BASE_URL,
-  DEFAULT_FEATHERLESS_BASE_URL,
-  DEFAULT_FORMALIZER_MODEL,
-  DEFAULT_AUXILIARY_MODEL,
+  OPENROUTER_KEY_REF,
   defaultProviderConfigSpecs,
-  hasApiKeyEnv,
-  deriveKeyRef,
 } from './model-config.js';
 
 // ---------------------------------------------------------------------------
-// Named provider registry — the two supported formalizer backends + auxiliary
+// Provider registry — OpenRouter only, for all three roles, behind one stored key
 // ---------------------------------------------------------------------------
 
-const NAMED_FORMALIZER_PROVIDERS = {
-  novita: {
-    label: 'DeepSeek Prover V2 671B',
-    provider: 'Novita',
-    baseUrl: DEFAULT_NOVITA_BASE_URL,
-    modelId: DEFAULT_FORMALIZER_MODEL,
-    keyRef: 'lale:novita.ai',
-    envKey: 'LALE_NOVITA_API_KEY',
-  },
-  featherless: {
-    label: 'Goedel Prover V2 32B',
-    provider: 'Featherless',
-    baseUrl: DEFAULT_FEATHERLESS_BASE_URL,
-    modelId: 'Goedel-LM/Goedel-Prover-V2-32B',
-    keyRef: 'lale:featherless.ai',
-    envKey: 'LALE_FEATHERLESS_API_KEY',
-  },
-} as const;
-
-const NAMED_AUXILIARY_PROVIDER = {
-  baseUrl: DEFAULT_OPENROUTER_BASE_URL,
-  modelId: DEFAULT_AUXILIARY_MODEL,
-  keyRef: 'lale:openrouter.ai',
-  envKey: 'LALE_OPENROUTER_API_KEY',
-} as const;
+// Effort and model come from the stored rows; nothing about the provider is
+// worth hardcoding beyond its name — a fixed label goes stale the moment a
+// default changes, as "Extra High" did when the formalizer dropped to high.
+const PROVIDER_NAME = 'OpenRouter';
 
 // ---------------------------------------------------------------------------
 // Startup
 // ---------------------------------------------------------------------------
 
-const PORT = Number.parseInt(process.env['PORT'] ?? '8765', 10);
-// Lean 4.15.0 binaries fail to load on macOS 15 (Sequoia) with
-// `__DATA_CONST segment missing SG_READ_ONLY flag` — the fix landed in the
-// 4.16/4.17 timeframe. Pinning past that. v4.20.0 has community-cache
-// coverage and is comfortably past the dyld fix.
-const DEFAULT_LEAN_VERSION = '4.20.0';
-// Mathlib revision must match the Lean toolchain; the literal string "latest"
-// is not a tag and cache-misses against the community CDN (spec §4 names the
-// cache as load-bearing for the zero-cost claim).
-const DEFAULT_MATHLIB_REVISION = 'v4.20.0';
-const DEFAULT_TOKEN_BUDGET = 100_000;
-const DEFAULT_WALL_CLOCK_CAP_MS = 60_000;
+// The extension reaches the service at a fixed address: `DEFAULT_PORT` is
+// baked into the manifest's `host_permissions` and into the panel's base URL,
+// neither of which can follow an override at runtime. `PORT` is therefore for
+// running a second service alongside the first, and startup says so.
+const PORT = Number.parseInt(process.env['PORT'] ?? String(DEFAULT_PORT), 10);
+// Supplied by the app shell, which knows the bundle's version; a terminal run
+// says so plainly rather than claiming a release number it does not have.
+const VERSION = process.env['LALE_VERSION'] ?? '0.0.0-dev';
+// Track a recent stable release rather than an old one: Mathlib's cache moved
+// to trust-scoped storage containers, and the bare container that pre-4.2x
+// clients read from is now labelled `legacy` and slated for retirement. Once
+// its public reads are revoked, an old pin stops hitting the cache and every
+// provision compiles Mathlib from source (spec §4 names the cache as
+// load-bearing for the zero-cost claim). A recent pin also keeps Mathlib's API
+// close to what the formalizer model writes.
+const DEFAULT_LEAN_VERSION = '4.33.1';
+// Mathlib revision must match the Lean toolchain exactly — tag vX.Y.Z carries
+// `lean-toolchain` = leanprover/lean4:vX.Y.Z. The literal string "latest" is
+// not a tag and cache-misses against the community CDN.
+const DEFAULT_MATHLIB_REVISION = 'v4.33.1';
+
+// Built before anything that might want to report: a line written during
+// startup belongs in the file a tester is asked to send, not on a stdout the
+// packaged app has nowhere to show.
+const log = new Logger();
 
 const db = openDb();
 const cache = new LeanCheckCache(db);
+// The token is never printed: a packaged app has no terminal to print it to,
+// and the extension now asks to pair instead of being handed a secret to carry.
 const bearerToken = getOrCreateToken(db);
 const leanProjectDir = process.env['LALE_LEAN_PROJECT_DIR'] ?? join(homedir(), '.lale', 'lean-project');
 initProjectDir(leanProjectDir);
-markInterruptedRuns(db);
+markInterruptedRuns(db, log);
+dropPinnedVersionsFromProjectSettings(db);
 
-console.log('─'.repeat(60));
-console.log('lale desktop service starting');
-console.log(`Port:        ${PORT}`);
-console.log(`DB:          ${join(homedir(), '.lale', 'lale.db')}`);
-console.log(`Lean project: ${leanProjectDir}`);
-console.log('');
-console.log('Extension connection token (paste into extension settings):');
-console.log(`  ${bearerToken}`);
-console.log('─'.repeat(60));
+export const pairing = new PairingBroker();
+let pairedOrigins = readPairedOrigins(db);
 
-// ---------------------------------------------------------------------------
-// Default provider configs (from env vars, for v0 bootstrapping)
-// ---------------------------------------------------------------------------
+log.info('─'.repeat(60));
+log.info(`lale desktop service ${VERSION} starting`);
+log.info(`Port:         ${PORT}`);
+log.info(`DB:           ${process.env['LALE_DATA_DIR'] ?? join(homedir(), '.lale')}/lale.db`);
+log.info(`Lean project: ${leanProjectDir}`);
+log.info(`Log file:     ${log.filePath}`);
+log.info(`Paired:       ${pairedOrigins.size > 0 ? [...pairedOrigins].join(', ') : 'nothing yet — the extension will ask'}`);
+if (PORT !== DEFAULT_PORT) {
+  log.info(`Note:         the extension only ever looks at port ${DEFAULT_PORT}, so it will not find this one.`);
+}
+log.info('─'.repeat(60));
+setServicePort(PORT);
 
-ensureDefaultProviderConfigs(db);
-syncDefaultAuxiliaryConfig(db);
+// Without an app shell there is no window to prompt in, so a terminal session
+// approves its own pairing requests. A packaged build registers a real approver
+// over the top of this one.
+if (process.stdout.isTTY) pairing.setApprover(approveFromTerminal((message) => log.info(message)));
+
+// Provisioning is long, unattended, and the thing most likely to go wrong on a
+// machine that is not this one; its events belong in the log file.
+setProvisionLogSink((level, message) => {
+  if (level === 'error') log.error(message);
+  else log.info(message);
+});
+
+// When the service runs as a child of the macOS shell, approval travels over
+// the IPC channel: the shell shows the prompt, a person answers, the decision
+// comes back. Running the service in its own process also keeps a native-module
+// fault away from the menu bar, and lets the shell restart it.
+if (typeof process.send === 'function') {
+  const waiting = new Map<string, (decision: 'approved' | 'denied') => void>();
+
+  process.on('message', (message: unknown) => {
+    if (typeof message !== 'object' || message === null) return;
+    const { type, requestId, decision } = message as Record<string, unknown>;
+    if (type !== 'pairing-decision' || typeof requestId !== 'string') return;
+    waiting.get(requestId)?.(decision === 'approved' ? 'approved' : 'denied');
+    waiting.delete(requestId);
+  });
+
+  pairing.setApprover(async (request) => new Promise((resolve) => {
+    waiting.set(request.requestId, (decision) => {
+      log.info(`Pairing decision for ${request.origin}: ${decision}`);
+      resolve(decision);
+    });
+    process.send?.({ type: 'pairing-request', ...request });
+  }));
+}
 
 // ---------------------------------------------------------------------------
 // HTTP server
@@ -129,7 +167,7 @@ syncDefaultAuxiliaryConfig(db);
 const server = createServer(async (req, res) => {
   // CORS — only echo back the origin for allowed origins to prevent DNS-rebinding.
   const origin = req.headers['origin'] ?? '';
-  if (isOriginAllowed(origin)) {
+  if (isOriginAllowed(origin, pairedOrigins) || new URL(req.url ?? '/', 'http://127.0.0.1').pathname === '/v1/pair') {
     res.setHeader('access-control-allow-origin', origin || '*');
     res.setHeader('access-control-allow-methods', 'GET,POST,PUT,PATCH,DELETE,OPTIONS');
     res.setHeader('access-control-allow-headers', 'content-type,authorization');
@@ -143,7 +181,7 @@ const server = createServer(async (req, res) => {
   }
 
   // Auth check.
-  const auth = checkAuth(req, bearerToken);
+  const auth = checkAuth(req, bearerToken, pairedOrigins);
   if (!auth.ok) {
     const reason = auth.reason ?? 'Unauthorized';
     if (reason.includes('Origin')) {
@@ -157,14 +195,38 @@ const server = createServer(async (req, res) => {
   try {
     await route(req, res);
   } catch (err) {
-    console.error('Unhandled error:', err);
+    log.error(`Unhandled error: ${String(err)}`);
     sendJson(res, 500, { error: 'Internal server error' });
   }
 });
 
-server.listen(PORT, '127.0.0.1', () => {
-  console.log(`Listening on http://127.0.0.1:${PORT}`);
+server.on('error', (err: NodeJS.ErrnoException) => {
+  if (err.code === 'EADDRINUSE') {
+    log.error(`Port ${PORT} is already in use — another lale desktop is probably running. Quit it and try again.`);
+    process.exit(2);
+  }
+  log.error(`Server error: ${err.message}`);
+  process.exit(1);
 });
+
+/**
+ * Brings the service up. Kept out of module scope so an embedding shell — the
+ * macOS menu-bar app — can register a pairing approver *before* the port opens,
+ * rather than racing a request that arrives first.
+ */
+export async function start(): Promise<void> {
+  ensureDefaultProviderConfigs(db);
+  await syncProviderConfigsToDefaults(db);
+
+  await new Promise<void>((resolve) => {
+    server.listen(PORT, '127.0.0.1', () => {
+      const address = server.address();
+      log.info(`Listening on http://127.0.0.1:${typeof address === 'object' && address ? address.port : PORT}`);
+      process.send?.({ type: 'ready', port: PORT, token: bearerToken, logFile: log.filePath });
+      resolve();
+    });
+  });
+}
 
 // Graceful shutdown — kill any in-flight provisioning children so they don't
 // orphan and hold elan/lake locks past the next start. Only catches SIGTERM
@@ -173,7 +235,7 @@ let shuttingDown = false;
 function gracefulShutdown(signal: NodeJS.Signals): void {
   if (shuttingDown) return;
   shuttingDown = true;
-  console.log(`\nReceived ${signal} — terminating spawned child processes…`);
+  log.info(`Received ${signal} — terminating spawned child processes…`);
   killActiveProvisionChildren(signal === 'SIGINT' ? 'SIGINT' : 'SIGTERM');
   server.close(() => process.exit(0));
   // Hard backstop if server.close hangs on an open SSE connection.
@@ -189,6 +251,10 @@ process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   const pathname = new URL(req.url ?? '/', 'http://127.0.0.1').pathname;
 
+  if (req.method === 'POST' && pathname === '/v1/pair') {
+    return handlePair(req, res);
+  }
+
   if (req.method === 'GET' && pathname === '/v1/health') {
     return handleHealth(res);
   }
@@ -203,7 +269,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     if (!runId) { sendJson(res, 404, { error: 'Not found' }); return; }
 
     if (parts[4] === 'events') {
-      return handleRunEvents(req, res, runId);
+      return handleRunEvents(res, runId);
     }
     return handleGetRun(res, runId);
   }
@@ -238,12 +304,6 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     return handleListProviderConfigs(res);
   }
 
-  if (req.method === 'PATCH' && pathname.match(/^\/v1\/provider-configs\/[^/]+$/)) {
-    const configId = pathname.split('/')[3];
-    if (!configId) { sendJson(res, 404, { error: 'Not found' }); return; }
-    return handleSwitchFormalizer(req, res, configId);
-  }
-
   if (req.method === 'PUT' && pathname.match(/^\/v1\/provider-keys\/[^/]+$/)) {
     const provider = pathname.split('/')[3];
     if (!provider) { sendJson(res, 404, { error: 'Not found' }); return; }
@@ -254,18 +314,6 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
     const provider = pathname.split('/')[3];
     if (!provider) { sendJson(res, 404, { error: 'Not found' }); return; }
     return handleClearNamedProviderKey(res, provider);
-  }
-
-  if (req.method === 'PUT' && pathname.match(/^\/v1\/provider-configs\/[^/]+\/key$/)) {
-    const configId = pathname.split('/')[3];
-    if (!configId) { sendJson(res, 404, { error: 'Not found' }); return; }
-    return handleSetProviderKey(req, res, configId);
-  }
-
-  if (req.method === 'DELETE' && pathname.match(/^\/v1\/provider-configs\/[^/]+\/key$/)) {
-    const configId = pathname.split('/')[3];
-    if (!configId) { sendJson(res, 404, { error: 'Not found' }); return; }
-    return handleClearProviderKey(res, configId);
   }
 
   if (req.method === 'POST' && pathname === '/v1/provision') {
@@ -279,7 +327,7 @@ async function route(req: IncomingMessage, res: ServerResponse): Promise<void> {
   if (req.method === 'GET' && pathname.match(/^\/v1\/provision\/[^/]+\/events$/)) {
     const provisionId = pathname.split('/')[3];
     if (!provisionId) { sendJson(res, 404, { error: 'Not found' }); return; }
-    return handleProvisionEvents(req, res, provisionId);
+    return handleProvisionEvents(res, provisionId);
   }
 
   sendJson(res, 404, { error: 'Not found' });
@@ -296,7 +344,13 @@ interface LeanStatusCache {
 
 let leanStatusCache: LeanStatusCache | null = null;
 
-function detectLeanStatus(projectDir: string): Promise<HealthResponse['lean']> {
+async function detectLeanStatus(projectDir: string): Promise<HealthResponse['lean']> {
+  // Readiness comes from the provisioner rather than a second file check of its
+  // own. The two used to disagree — this one never looked for `lakefile.lean` —
+  // so `/v1/health` and `/v1/provision` could give the extension opposite
+  // answers about the same directory.
+  const { ready: projectReady } = await inspectProvisionedProject(projectDir);
+
   return new Promise((resolve) => {
     // Resolve PATH so an elan installed under ~/.elan/bin is visible even if the
     // user hasn't sourced its shell hook yet.
@@ -305,8 +359,6 @@ function detectLeanStatus(projectDir: string): Promise<HealthResponse['lean']> {
     if (!pathParts.includes(elanBin)) pathParts.unshift(elanBin);
     const env = { ...process.env, PATH: pathParts.join(':') };
 
-    const projectReady = existsSync(join(projectDir, 'lean-toolchain'))
-      && existsSync(join(projectDir, '.lake'));
     const cwd = existsSync(projectDir) ? projectDir : homedir();
     const child = spawn(
       'bash',
@@ -357,6 +409,50 @@ function invalidateLeanStatusCache(): void {
 }
 
 // ---------------------------------------------------------------------------
+// Toolchain versions
+//
+// There is one provisioned Lean project per install, so what a run actually
+// compiles against is whatever that project holds — not what was current when
+// the Overleaf project was first linked. Runs and cache keys therefore read the
+// provisioned toolchain, falling back to the defaults before the first
+// provision. Recording a stale version here would let a cached result from an
+// older toolchain be served for a goal the current one may no longer accept.
+// ---------------------------------------------------------------------------
+
+interface ToolchainVersions {
+  leanVersion: string;
+  mathlibRevision: string;
+}
+
+let toolchainCache: { result: ToolchainVersions; expiresAt: number } | null = null;
+
+async function getToolchainVersions(): Promise<ToolchainVersions> {
+  if (toolchainCache && Date.now() < toolchainCache.expiresAt) {
+    return toolchainCache.result;
+  }
+  const provisioned = await inspectProvisionedProject(leanProjectDir);
+  const result: ToolchainVersions = {
+    leanVersion: normalizeLeanVersion(provisioned.leanVersion) ?? DEFAULT_LEAN_VERSION,
+    mathlibRevision: provisioned.mathlibRevision ?? DEFAULT_MATHLIB_REVISION,
+  };
+  toolchainCache = { result, expiresAt: Date.now() + 30_000 };
+  return result;
+}
+
+function invalidateToolchainCache(): void {
+  toolchainCache = null;
+}
+
+// `lean-toolchain` holds a full toolchain name (`leanprover/lean4:v4.33.1`);
+// reduce it to the bare version so a value read from disk and the default
+// compare equal and produce the same cache key.
+function normalizeLeanVersion(toolchain: string | null): string | null {
+  const trimmed = toolchain?.trim();
+  if (!trimmed) return null;
+  return /(?:^|:)v?(\d[\w.-]*)$/.exec(trimmed)?.[1] ?? trimmed;
+}
+
+// ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
@@ -369,6 +465,7 @@ async function handleHealth(res: ServerResponse): Promise<void> {
 
   sendJson(res, 200, {
     protocolVersion: 1,
+    version: VERSION,
     status: lean.available ? 'ok' : 'degraded',
     lean,
     cache: { available: true, entries: cacheEntries },
@@ -419,20 +516,23 @@ async function handleVerify(req: IncomingMessage, res: ServerResponse): Promise<
   }
 
   const settings = parseSettings(project.settingsJson);
-  const leanVersion: string = (settings['leanVersion'] as string | undefined) ?? DEFAULT_LEAN_VERSION;
-  const mathlibRevision: string = (settings['mathlibRevision'] as string | undefined) ?? DEFAULT_MATHLIB_REVISION;
-  const tokenBudgetCap: number = (settings['tokenBudgetCap'] as number | undefined) ?? DEFAULT_TOKEN_BUDGET;
+  const { leanVersion, mathlibRevision } = await getToolchainVersions();
+  const tokenBudgetCap: number = (settings['tokenBudgetCap'] as number | undefined) ?? DEFAULT_TOKEN_BUDGET_CAP;
   const wallClockCapMs: number = (settings['wallClockCapMs'] as number | undefined) ?? DEFAULT_WALL_CLOCK_CAP_MS;
 
   // Resolve provider configs.
+  syncProjectProviderConfigsFromGlobal(db);
   const configs = db
     .prepare('SELECT * FROM model_provider_configs WHERE projectId = ?')
     .all(resolvedProjectId) as ProviderConfigRow[];
 
   const formalizerConfig = configs.find((c) => c.role === 'formalizer');
   const auxiliaryConfig = configs.find((c) => c.role === 'auxiliary');
+  // Installs from before the proposer had its own row fall back to the
+  // formalizer's, which is what they were using anyway.
+  const proposerConfig = configs.find((c) => c.role === 'proposer') ?? formalizerConfig;
 
-  if (!formalizerConfig || !auxiliaryConfig) {
+  if (!formalizerConfig || !auxiliaryConfig || !proposerConfig) {
     sendJson(res, 422, { error: 'Provider configs not configured for this project.' });
     return;
   }
@@ -445,11 +545,11 @@ async function handleVerify(req: IncomingMessage, res: ServerResponse): Promise<
     parsedDocumentFingerprint,
     parserVersion,
     leanProjectDir,
+    mode: body.data.mode,
   }, {
     leanVersion,
     mathlibRevision,
-    // The formalizer model handles both formalization and proving.
-    proverConfigId: formalizerConfig.providerConfigId,
+    proposerConfigId: proposerConfig.providerConfigId,
     formalizerConfigId: formalizerConfig.providerConfigId,
     auxiliaryConfigId: auxiliaryConfig.providerConfigId,
     tokenBudgetCap,
@@ -465,7 +565,7 @@ async function handleVerify(req: IncomingMessage, res: ServerResponse): Promise<
   } satisfies AcceptedRunResponse);
 }
 
-function handleRunEvents(req: IncomingMessage, res: ServerResponse, runId: string): void {
+function handleRunEvents(res: ServerResponse, runId: string): void {
   res.writeHead(200, {
     'content-type': 'text/event-stream',
     'cache-control': 'no-cache',
@@ -517,16 +617,15 @@ function handleRunEvents(req: IncomingMessage, res: ServerResponse, runId: strin
     return;
   }
 
-  // Subscribe to live events.
-  const unsubscribe = subscribeSse(runId, (chunk) => {
+  // Heartbeats keep long reasoning requests visible to the extension worker.
+  const heartbeat = setInterval(() => res.write(': heartbeat\n\n'), 15_000);
+  const unsubscribe = subscribeSse(runId, chunk => {
     res.write(chunk);
-    if (chunk.startsWith('event: complete')) {
-      res.end();
-      unsubscribe();
-    }
+    if (chunk.startsWith('event: complete')) { res.end(); cleanup(); }
   });
+  const cleanup = (): void => { clearInterval(heartbeat); unsubscribe(); };
+  res.on('close', cleanup);
 
-  req.on('close', unsubscribe);
 }
 
 function handleGetRun(res: ServerResponse, runId: string): void {
@@ -570,17 +669,20 @@ function handleGetRun(res: ServerResponse, runId: string): void {
     )
     .get(runId) as { leanSource: string } | undefined;
 
+  // Status, outcome and verdict are stored as bare text, so they are read back
+  // through the same enums the client will parse them with. A row written by an
+  // older build reports as absent rather than failing the client's parse.
   sendJson(res, 200, {
     protocolVersion: 1,
     runId: run.auditRunId,
     claimId,
-    status: run.status,
-    outcome: run.outcome ?? null,
-    faithfulnessVerdict: faithfulnessRow?.verdict ?? null,
+    status: AuditRunStatus.catch('finished').parse(run.status),
+    outcome: parseVerificationOutcome(run.outcome),
+    faithfulnessVerdict: FaithfulnessVerdict.safeParse(faithfulnessRow?.verdict).data ?? null,
     leanSource: artifactRow?.leanSource ?? null,
-    diagnostics: [],
+    diagnostics: (db.prepare("SELECT message FROM run_events WHERE auditRunId = ? AND level IN ('warning', 'error') ORDER BY rowid").all(runId) as Array<{ message: string }>).map(row => row.message),
     durationMs: run.durationMs ?? null,
-  });
+  } satisfies RunResult);
 }
 
 async function handleProjectLookup(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -605,7 +707,7 @@ async function handleProjectLookup(req: IncomingMessage, res: ServerResponse): P
   }
 
   if (project) {
-    const settings = parseSettings(project.settingsJson);
+    const { leanVersion, mathlibRevision } = await getToolchainVersions();
     sendJson(res, 200, {
       protocolVersion: 1,
       status: 'linked',
@@ -616,10 +718,10 @@ async function handleProjectLookup(req: IncomingMessage, res: ServerResponse): P
         overleafProjectId: project.overleafProjectId,
         createdAt: project.createdAt,
         lastOpenedAt: project.lastOpenedAt,
-        leanVersion: (settings['leanVersion'] as string | undefined) ?? DEFAULT_LEAN_VERSION,
-        mathlibRevision: (settings['mathlibRevision'] as string | undefined) ?? DEFAULT_MATHLIB_REVISION,
+        leanVersion,
+        mathlibRevision,
       },
-      claimStatuses: listProjectClaimStatuses(db, project.projectId),
+      claimStatuses: listProjectClaimStatuses(db, project.projectId, body.data.documentFingerprint),
     } satisfies ProjectLookupResponse);
     return;
   }
@@ -639,13 +741,9 @@ async function handleCreateProject(req: IncomingMessage, res: ServerResponse): P
     return;
   }
 
-  const {
-    overleafProjectId,
-    overleafUrl,
-    name,
-    leanVersion = DEFAULT_LEAN_VERSION,
-    mathlibRevision = DEFAULT_MATHLIB_REVISION,
-  } = body.data;
+  const { overleafProjectId, overleafUrl, name } = body.data;
+  // Versions are a property of the install's Lean project, not of this record.
+  const { leanVersion, mathlibRevision } = await getToolchainVersions();
 
   const now = new Date().toISOString();
   const projectId = randomUUID();
@@ -660,10 +758,10 @@ async function handleCreateProject(req: IncomingMessage, res: ServerResponse): P
     name,
     now,
     now,
-    JSON.stringify({ leanVersion, mathlibRevision }),
+    JSON.stringify({}),
   );
 
-  // Create default provider configs using env-var defaults.
+  // Create default provider configs.
   createDefaultConfigs(db, projectId);
 
   sendJson(res, 201, {
@@ -683,7 +781,7 @@ async function handleCreateProject(req: IncomingMessage, res: ServerResponse): P
   } satisfies ProjectLookupResponse);
 }
 
-function handleGetProject(res: ServerResponse, projectId: string): void {
+async function handleGetProject(res: ServerResponse, projectId: string): Promise<void> {
   const project = db
     .prepare('SELECT * FROM projects WHERE projectId = ?')
     .get(projectId) as ProjectRow | undefined;
@@ -693,7 +791,7 @@ function handleGetProject(res: ServerResponse, projectId: string): void {
     return;
   }
 
-  const settings = parseSettings(project.settingsJson);
+  const { leanVersion, mathlibRevision } = await getToolchainVersions();
   sendJson(res, 200, {
     id: project.projectId,
     name: project.name,
@@ -701,8 +799,8 @@ function handleGetProject(res: ServerResponse, projectId: string): void {
     overleafProjectId: project.overleafProjectId,
     createdAt: project.createdAt,
     lastOpenedAt: project.lastOpenedAt,
-    leanVersion: settings.leanVersion ?? DEFAULT_LEAN_VERSION,
-    mathlibRevision: settings.mathlibRevision ?? DEFAULT_MATHLIB_REVISION,
+    leanVersion,
+    mathlibRevision,
   });
 }
 
@@ -800,123 +898,95 @@ async function handleCreateOverride(
   sendJson(res, 201, { overrideId });
 }
 
+/**
+ * Pairing: a client asks, a person approves in the app, and the token comes back
+ * over this response. Reachable without a token by design — it is the only way
+ * to obtain one — and rate-limited by the fact that a human must click.
+ */
+async function handlePair(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const origin = normalizeOrigin(req.headers['origin'] ?? '');
+  const body = await readJson(req) as { clientName?: unknown } | null;
+  const clientName = typeof body?.clientName === 'string' ? body.clientName.slice(0, 80) : 'unknown client';
+
+  if (!origin) {
+    sendJson(res, 400, { error: 'Pairing requires an Origin header' });
+    return;
+  }
+
+  if (!pairing.hasApprover) {
+    log.error(`Pairing request from ${origin} refused: no approver registered`);
+    sendJson(res, 503, { error: 'This service cannot ask for approval right now' });
+    return;
+  }
+
+  log.info(`Pairing request from ${origin} (${clientName})`);
+  let decision: 'approved' | 'denied';
+  try {
+    decision = await pairing.request(origin, clientName);
+  } catch (err) {
+    if (err instanceof PairingAlreadyPendingError) {
+      sendJson(res, 409, { error: err.message });
+      return;
+    }
+    throw err;
+  }
+
+  if (decision !== 'approved') {
+    log.info(`Pairing request from ${origin} denied`);
+    sendJson(res, 403, { error: 'Pairing was declined' });
+    return;
+  }
+
+  pairedOrigins = recordPairedOrigin(db, origin);
+  log.info(`Paired with ${origin}`);
+  sendJson(res, 200, { token: bearerToken });
+}
+
 async function handleListProviderConfigs(res: ServerResponse): Promise<void> {
   const formalizer = db
     .prepare("SELECT * FROM model_provider_configs WHERE projectId IS NULL AND role = 'formalizer'")
+    .get() as ProviderConfigRow | undefined;
+
+  const proposer = db
+    .prepare("SELECT * FROM model_provider_configs WHERE projectId IS NULL AND role = 'proposer'")
     .get() as ProviderConfigRow | undefined;
 
   const auxiliary = db
     .prepare("SELECT * FROM model_provider_configs WHERE projectId IS NULL AND role = 'auxiliary'")
     .get() as ProviderConfigRow | undefined;
 
-  const keyPresence = await checkNamedKeyPresence();
-
-  const formalizerBaseUrl = formalizer?.baseUrl ?? '';
-  const featherlessActive = formalizerBaseUrl.includes('featherless.ai');
-  const configId = formalizer?.providerConfigId ?? '';
+  // One OpenRouter key backs every role, so key presence is a single flag.
+  const hasKey = await hasStoredOpenRouterKey();
 
   sendJson(res, 200, {
-    formalizerOptions: [
-      {
-        optionKey: 'novita',
-        label: NAMED_FORMALIZER_PROVIDERS.novita.label,
-        provider: NAMED_FORMALIZER_PROVIDERS.novita.provider,
-        baseUrl: NAMED_FORMALIZER_PROVIDERS.novita.baseUrl,
-        modelId: NAMED_FORMALIZER_PROVIDERS.novita.modelId,
-        active: !featherlessActive,
-        hasKey: keyPresence.novita,
-        configId,
-      },
-      {
-        optionKey: 'featherless',
-        label: NAMED_FORMALIZER_PROVIDERS.featherless.label,
-        provider: NAMED_FORMALIZER_PROVIDERS.featherless.provider,
-        baseUrl: NAMED_FORMALIZER_PROVIDERS.featherless.baseUrl,
-        modelId: NAMED_FORMALIZER_PROVIDERS.featherless.modelId,
-        active: featherlessActive,
-        hasKey: keyPresence.featherless,
-        configId,
-      },
-    ],
-    auxiliaryConfig: auxiliary
-      ? {
-          providerConfigId: auxiliary.providerConfigId,
-          modelId: auxiliary.modelId,
-          baseUrl: auxiliary.baseUrl,
-          hasKey: keyPresence.openrouter || hasApiKeyEnv(auxiliary, process.env),
-        }
-      : null,
-  });
+    formalizerConfig: summarizeProviderConfig(formalizer),
+    proposerConfig: summarizeProviderConfig(proposer),
+    auxiliaryConfig: summarizeProviderConfig(auxiliary),
+    hasKey,
+  } satisfies ProviderConfigsResponse);
 }
 
-async function checkNamedKeyPresence(): Promise<{ novita: boolean; featherless: boolean; openrouter: boolean }> {
-  const result = {
-    novita: Boolean(process.env[NAMED_FORMALIZER_PROVIDERS.novita.envKey]?.trim()),
-    featherless: Boolean(process.env[NAMED_FORMALIZER_PROVIDERS.featherless.envKey]?.trim()),
-    openrouter: Boolean(process.env[NAMED_AUXILIARY_PROVIDER.envKey]?.trim()),
-  };
-
-  try {
-    const keytar = await import('keytar');
-    const [novita, featherless, openrouter] = await Promise.all([
-      keytar.default.getPassword('lale', 'novita.ai'),
-      keytar.default.getPassword('lale', 'featherless.ai'),
-      keytar.default.getPassword('lale', 'openrouter.ai'),
-    ]);
-    if (novita) result.novita = true;
-    if (featherless) result.featherless = true;
-    if (openrouter) result.openrouter = true;
-  } catch { /* keytar unavailable — env-var results stand */ }
-
-  return result;
+function summarizeProviderConfig(row: ProviderConfigRow | undefined): ProviderConfigSummary | null {
+  return row
+    ? {
+        providerConfigId: row.providerConfigId,
+        provider: PROVIDER_NAME,
+        modelId: row.modelId,
+        baseUrl: row.baseUrl,
+        reasoningEffort: row.reasoningEffort,
+      }
+    : null;
 }
 
-async function handleSwitchFormalizer(
-  req: IncomingMessage,
-  res: ServerResponse,
-  configId: string,
-): Promise<void> {
-  const body = await readJson(req) as { optionKey?: unknown } | null;
-  const optionKey = body?.optionKey;
-  if (optionKey !== 'novita' && optionKey !== 'featherless') {
-    sendJson(res, 400, { error: 'optionKey must be "novita" or "featherless"' });
-    return;
-  }
-
-  const spec = NAMED_FORMALIZER_PROVIDERS[optionKey];
-
-  const globalConfig = db
-    .prepare("SELECT providerConfigId FROM model_provider_configs WHERE providerConfigId = ? AND projectId IS NULL AND role = 'formalizer'")
-    .get(configId) as { providerConfigId: string } | undefined;
-  if (!globalConfig) {
-    sendJson(res, 404, { error: 'Formalizer config not found' });
-    return;
-  }
-
-  // Carry over a keytar key for the new provider if it already exists.
-  let apiKeyRef: string | null = null;
+async function hasStoredOpenRouterKey(): Promise<boolean> {
   try {
     const keytar = await import('keytar');
-    const [service, account] = spec.keyRef.split(':') as [string, string];
-    const key = await keytar.default.getPassword(service, account);
-    if (key) apiKeyRef = spec.keyRef;
-  } catch { /* ignore */ }
-  if (!apiKeyRef && process.env[spec.envKey]?.trim()) apiKeyRef = spec.keyRef;
-
-  const result = db
-    .prepare(
-      `UPDATE model_provider_configs
-       SET providerKind = 'openaiCompatible', baseUrl = ?, modelId = ?, apiKeyRef = ?, updatedAt = ?
-       WHERE providerConfigId = ? AND projectId IS NULL AND role = 'formalizer'`,
-    )
-    .run(spec.baseUrl, spec.modelId, apiKeyRef, new Date().toISOString(), configId);
-
-  if (result.changes === 0) {
-    sendJson(res, 404, { error: 'Formalizer config not found' });
-    return;
+    const [service, account] = OPENROUTER_KEY_REF.split(':') as [string, string];
+    return Boolean(await keytar.default.getPassword(service, account));
+  } catch {
+    // keytar unavailable — no key can be stored, so none is present.
+    return false;
   }
-
-  sendJson(res, 200, { ok: true });
 }
 
 async function handleSetNamedProviderKey(
@@ -924,15 +994,10 @@ async function handleSetNamedProviderKey(
   res: ServerResponse,
   provider: string,
 ): Promise<void> {
-  const isKnown = provider in NAMED_FORMALIZER_PROVIDERS || provider === 'openrouter';
-  if (!isKnown) {
+  if (provider !== 'openrouter') {
     sendJson(res, 404, { error: 'Unknown provider' });
     return;
   }
-
-  const spec = provider === 'openrouter'
-    ? NAMED_AUXILIARY_PROVIDER
-    : NAMED_FORMALIZER_PROVIDERS[provider as 'novita' | 'featherless'];
 
   const body = await readJson(req) as { key?: unknown } | null;
   const key = typeof body?.key === 'string' ? body.key.trim() : '';
@@ -941,7 +1006,7 @@ async function handleSetNamedProviderKey(
     return;
   }
 
-  const [service, account] = spec.keyRef.split(':') as [string, string];
+  const [service, account] = OPENROUTER_KEY_REF.split(':') as [string, string];
   try {
     const keytar = await import('keytar');
     await keytar.default.setPassword(service, account, key);
@@ -950,25 +1015,21 @@ async function handleSetNamedProviderKey(
     return;
   }
 
+  // All three roles run on the same endpoint, so this points every config at the key.
   db.prepare(
     `UPDATE model_provider_configs SET apiKeyRef = ?, updatedAt = ? WHERE baseUrl = ?`,
-  ).run(spec.keyRef, new Date().toISOString(), spec.baseUrl);
+  ).run(OPENROUTER_KEY_REF, new Date().toISOString(), DEFAULT_OPENROUTER_BASE_URL);
 
   sendJson(res, 200, { ok: true });
 }
 
 async function handleClearNamedProviderKey(res: ServerResponse, provider: string): Promise<void> {
-  const isKnown = provider in NAMED_FORMALIZER_PROVIDERS || provider === 'openrouter';
-  if (!isKnown) {
+  if (provider !== 'openrouter') {
     sendJson(res, 404, { error: 'Unknown provider' });
     return;
   }
 
-  const spec = provider === 'openrouter'
-    ? NAMED_AUXILIARY_PROVIDER
-    : NAMED_FORMALIZER_PROVIDERS[provider as 'novita' | 'featherless'];
-
-  const [service, account] = spec.keyRef.split(':') as [string, string];
+  const [service, account] = OPENROUTER_KEY_REF.split(':') as [string, string];
   try {
     const keytar = await import('keytar');
     await keytar.default.deletePassword(service, account);
@@ -976,79 +1037,7 @@ async function handleClearNamedProviderKey(res: ServerResponse, provider: string
 
   db.prepare(
     `UPDATE model_provider_configs SET apiKeyRef = NULL, updatedAt = ? WHERE apiKeyRef = ?`,
-  ).run(new Date().toISOString(), spec.keyRef);
-
-  sendJson(res, 200, { ok: true });
-}
-
-async function handleSetProviderKey(
-  req: IncomingMessage,
-  res: ServerResponse,
-  configId: string,
-): Promise<void> {
-  const body = await readJson(req) as { key?: unknown } | null;
-  const key = typeof body?.key === 'string' ? body.key.trim() : '';
-  if (!key) {
-    sendJson(res, 400, { error: 'key is required' });
-    return;
-  }
-
-  const config = db
-    .prepare('SELECT * FROM model_provider_configs WHERE providerConfigId = ? AND projectId IS NULL')
-    .get(configId) as ProviderConfigRow | undefined;
-  if (!config) {
-    sendJson(res, 404, { error: 'Provider config not found' });
-    return;
-  }
-
-  const keyRef = deriveKeyRef(config);
-  const [service, account] = keyRef.split(':') as [string, string];
-
-  try {
-    const keytar = await import('keytar');
-    await keytar.default.setPassword(service, account, key);
-  } catch (err) {
-    sendJson(res, 500, { error: `Failed to store key in keychain: ${String(err)}` });
-    return;
-  }
-
-  // Update every config that hits the same provider endpoint so projects share the ref.
-  db.prepare(
-    `UPDATE model_provider_configs SET apiKeyRef = ?, updatedAt = ?
-     WHERE (baseUrl = ? AND baseUrl IS NOT NULL)
-       OR providerConfigId = ?
-     `,
-  ).run(keyRef, new Date().toISOString(), config.baseUrl, configId);
-
-  sendJson(res, 200, { ok: true });
-}
-
-async function handleClearProviderKey(res: ServerResponse, configId: string): Promise<void> {
-  const config = db
-    .prepare('SELECT * FROM model_provider_configs WHERE providerConfigId = ? AND projectId IS NULL')
-    .get(configId) as ProviderConfigRow | undefined;
-  if (!config) {
-    sendJson(res, 404, { error: 'Provider config not found' });
-    return;
-  }
-
-  const keyRef = config.apiKeyRef;
-  if (!keyRef) {
-    sendJson(res, 200, { ok: true });
-    return;
-  }
-
-  const [service, account] = keyRef.split(':') as [string, string];
-  try {
-    const keytar = await import('keytar');
-    await keytar.default.deletePassword(service, account);
-  } catch {
-    // Best-effort — proceed to clear the DB ref even if keychain removal fails.
-  }
-
-  db.prepare(
-    `UPDATE model_provider_configs SET apiKeyRef = NULL, updatedAt = ? WHERE apiKeyRef = ?`,
-  ).run(new Date().toISOString(), keyRef);
+  ).run(new Date().toISOString(), OPENROUTER_KEY_REF);
 
   sendJson(res, 200, { ok: true });
 }
@@ -1077,6 +1066,7 @@ async function handleStartProvision(req: IncomingMessage, res: ServerResponse): 
 
     // Once provisioning kicks off, the previous health snapshot is stale.
     invalidateLeanStatusCache();
+    invalidateToolchainCache();
     clearMathlibImportIndexCache();
 
     if (result.alreadyReady) {
@@ -1109,7 +1099,6 @@ async function handleGetProvisionState(res: ServerResponse): Promise<void> {
 }
 
 function handleProvisionEvents(
-  req: IncomingMessage,
   res: ServerResponse,
   provisionId: string,
 ): void {
@@ -1125,31 +1114,38 @@ function handleProvisionEvents(
     res.write(`event: provision_event\ndata: ${JSON.stringify(event)}\n\n`);
   }
 
-  void inspectProvisionedProject(leanProjectDir).then(async () => {
-    const state = await getProvisionState();
-    if (state.provisionId === provisionId && state.status !== 'running') {
-      res.write(
-        `event: complete\ndata: ${JSON.stringify({ provisionId, status: state.status, error: state.error })}\n\n`,
-      );
-      res.end();
-    }
-  });
+  // A provision that finished before this request arrived is reported from
+  // stored state; a live one is reported by the subscription. Both race to
+  // close the stream, so completion happens exactly once either way.
+  let finished = false;
+  const complete = (payload: Record<string, unknown>, chunk?: string): void => {
+    if (finished) return;
+    finished = true;
+    // The provisioning state has changed; force-refresh the health snapshot.
+    invalidateLeanStatusCache();
+    invalidateToolchainCache();
+    clearMathlibImportIndexCache();
+    res.write(chunk ?? `event: complete\ndata: ${JSON.stringify(payload)}\n\n`);
+    res.end();
+    unsubscribe();
+  };
 
   const unsubscribe = subscribeProvisionSse(provisionId, (chunk) => {
-    res.write(chunk);
-    if (chunk.startsWith('event: complete')) {
-      // The provisioning state has changed; force-refresh the health snapshot.
-      invalidateLeanStatusCache();
-      clearMathlibImportIndexCache();
-      res.end();
-      unsubscribe();
+    if (finished) return;
+    if (chunk.startsWith('event: complete')) complete({}, chunk);
+    else res.write(chunk);
+  });
+
+  void getProvisionState().then((state) => {
+    if (state.provisionId === provisionId && state.status !== 'running') {
+      complete({ provisionId, status: state.status, error: state.error });
     }
   });
 
-  req.on('close', unsubscribe);
+  res.on('close', () => { finished = true; unsubscribe(); });
 }
 
-function markInterruptedRuns(db: DatabaseInstance): void {
+function markInterruptedRuns(db: DatabaseInstance, log: Logger): void {
   const interruptedRuns = db
     .prepare(
       `SELECT auditRunId, phase, startedAt
@@ -1200,12 +1196,13 @@ function markInterruptedRuns(db: DatabaseInstance): void {
     );
   }
 
-  console.log(`Marked ${interruptedRuns.length} interrupted audit run(s) as verificationBlocked`);
+  log.info(`Marked ${interruptedRuns.length} interrupted audit run(s) as verificationBlocked`);
 }
 
 function listProjectClaimStatuses(
   db: DatabaseInstance,
   projectId: string,
+  currentDocumentFingerprint?: string | null,
 ): ProjectLookupResponse['claimStatuses'] {
   const identities = db
     .prepare(
@@ -1224,8 +1221,9 @@ function listProjectClaimStatuses(
   return identities.map((identity) => {
     const latestRun = db
       .prepare(
-        `SELECT ar.auditRunId, ar.status, ar.phase, ar.outcome, ar.startedAt, ar.finishedAt
+        `SELECT ar.auditRunId, ar.status, ar.phase, ar.outcome, ar.startedAt, ar.finishedAt, cr.claimFingerprint, ds.documentFingerprint
          FROM audit_runs ar
+         JOIN document_snapshots ds ON ds.snapshotId = ar.snapshotId
          JOIN claim_revisions cr ON cr.claimRevisionId = ar.targetClaimRevisionId
          WHERE cr.claimIdentityId = ?
          ORDER BY ar.startedAt DESC
@@ -1233,6 +1231,8 @@ function listProjectClaimStatuses(
       )
       .get(identity.claimIdentityId) as {
         auditRunId: string;
+        claimFingerprint: string;
+        documentFingerprint: string;
         status: string;
         phase: string | null;
         outcome: string | null;
@@ -1254,9 +1254,10 @@ function listProjectClaimStatuses(
 
     return {
       claimId: identity.currentLabel ?? identity.claimIdentityId,
+      claimFingerprint: latestRun?.claimFingerprint ?? null,
       label: identity.currentLabel,
       kind: identity.currentKind,
-      status: normalizeClaimStatus(identity.statusCache, latestRun),
+      status: currentDocumentFingerprint && latestRun && currentDocumentFingerprint !== latestRun.documentFingerprint && ['verified', 'formalized'].includes(latestRun.outcome ?? '') ? 'stale' : normalizeClaimStatus(identity.statusCache, latestRun),
       runId: latestRun?.auditRunId ?? null,
       phase: parseRunPhase(latestRun?.phase),
       outcome: parseVerificationOutcome(latestRun?.outcome),
@@ -1273,6 +1274,8 @@ function normalizeClaimStatus(
   if (latestRun?.status === 'queued' || latestRun?.status === 'running' || latestRun?.status === 'paused') {
     return 'checking';
   }
+
+  if (statusCache === 'stale' || statusCache === 'verifiedByOverride') return statusCache;
 
   if (latestRun?.status === 'finished') {
     const outcome = parseVerificationOutcome(latestRun.outcome);
@@ -1297,7 +1300,7 @@ function parseVerificationOutcome(value: string | null | undefined): Verificatio
 }
 
 // ---------------------------------------------------------------------------
-// Default provider config bootstrap (env-var based, for v0)
+// Default provider config bootstrap (API keys live in the OS keychain)
 // ---------------------------------------------------------------------------
 
 function ensureDefaultProviderConfigs(db: DatabaseInstance): void {
@@ -1316,86 +1319,93 @@ function createDefaultConfigs(db: DatabaseInstance, projectId: string | null): v
   if (projectId) {
     const globalConfigs = db
       .prepare(
-        `SELECT role, providerKind, baseUrl, modelId, apiKeyRef
+        `SELECT role, providerKind, baseUrl, modelId, apiKeyRef, reasoningEffort, maxTokens, temperature
          FROM model_provider_configs
-         WHERE projectId IS NULL AND role IN ('formalizer', 'auxiliary')`,
+         WHERE projectId IS NULL AND role IN ('proposer', 'formalizer', 'auxiliary')`,
       )
-      .all() as Array<Pick<ProviderConfigRow, 'role' | 'providerKind' | 'baseUrl' | 'modelId' | 'apiKeyRef'>>;
+      .all() as Array<Pick<ProviderConfigRow, 'role' | 'providerKind' | 'baseUrl' | 'modelId' | 'apiKeyRef' | 'reasoningEffort' | 'maxTokens' | 'temperature'>>;
 
     if (globalConfigs.length > 0) {
-      for (const { role, providerKind, baseUrl, modelId, apiKeyRef } of globalConfigs) {
+      for (const { role, providerKind, baseUrl, modelId, apiKeyRef, reasoningEffort, maxTokens, temperature } of globalConfigs) {
         db.prepare(
           `INSERT INTO model_provider_configs
-             (providerConfigId, projectId, role, providerKind, baseUrl, modelId, apiKeyRef, createdAt, updatedAt)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        ).run(randomUUID(), projectId, role, providerKind, baseUrl, modelId, apiKeyRef, now, now);
+             (providerConfigId, projectId, role, providerKind, baseUrl, modelId, apiKeyRef, reasoningEffort, maxTokens, temperature, createdAt, updatedAt)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).run(randomUUID(), projectId, role, providerKind, baseUrl, modelId, apiKeyRef, reasoningEffort, maxTokens, temperature, now, now);
       }
       return;
     }
   }
 
-  // v0: API keys are resolved at call time from role/provider-specific env vars
-  // (or later keytar). The apiKeyRef column stays null until a settings UI
-  // writes a keytar entry.
+  // The apiKeyRef column stays null until the settings UI writes a keytar entry.
   const apiKeyRef: string | null = null;
 
-  for (const { role, providerKind, baseUrl, modelId } of defaultProviderConfigSpecs(process.env)) {
+  for (const { role, providerKind, baseUrl, modelId, reasoningEffort, maxTokens, temperature } of defaultProviderConfigSpecs()) {
     db.prepare(
       `INSERT INTO model_provider_configs
-         (providerConfigId, projectId, role, providerKind, baseUrl, modelId, apiKeyRef, createdAt, updatedAt)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).run(randomUUID(), projectId, role, providerKind, baseUrl, modelId, apiKeyRef, now, now);
+         (providerConfigId, projectId, role, providerKind, baseUrl, modelId, apiKeyRef, reasoningEffort, maxTokens, temperature, createdAt, updatedAt)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(randomUUID(), projectId, role, providerKind, baseUrl, modelId, apiKeyRef, reasoningEffort, maxTokens, temperature, now, now);
   }
 }
 
-function syncDefaultAuxiliaryConfig(db: DatabaseInstance): void {
-  const auxiliary = defaultProviderConfigSpecs(process.env).find((config) => config.role === 'auxiliary');
-  if (!auxiliary) return;
-
-  const existing = db
-    .prepare("SELECT * FROM model_provider_configs WHERE projectId IS NULL AND role = 'auxiliary'")
-    .get() as ProviderConfigRow | undefined;
+// Pins every stored config back onto the built-in OpenRouter defaults. This
+// also migrates installs from earlier builds whose formalizer row still points
+// at a provider that is no longer supported.
+async function syncProviderConfigsToDefaults(db: DatabaseInstance): Promise<void> {
+  const apiKeyRef = (await hasStoredOpenRouterKey()) ? OPENROUTER_KEY_REF : null;
   const now = new Date().toISOString();
 
-  if (!existing) {
-    db.prepare(
-      `INSERT INTO model_provider_configs
-         (providerConfigId, projectId, role, providerKind, baseUrl, modelId, apiKeyRef, createdAt, updatedAt)
-       VALUES (?, NULL, 'auxiliary', ?, ?, ?, NULL, ?, ?)`,
-    ).run(randomUUID(), auxiliary.providerKind, auxiliary.baseUrl, auxiliary.modelId, now, now);
-    return;
-  }
+  for (const spec of defaultProviderConfigSpecs()) {
+    const existing = db
+      .prepare('SELECT * FROM model_provider_configs WHERE projectId IS NULL AND role = ?')
+      .get(spec.role) as ProviderConfigRow | undefined;
 
-  db.prepare(
-    `UPDATE model_provider_configs
-     SET providerKind = ?,
-         baseUrl = ?,
-         modelId = ?,
-         updatedAt = ?
-     WHERE providerConfigId = ?`,
-  ).run(auxiliary.providerKind, auxiliary.baseUrl, auxiliary.modelId, now, existing.providerConfigId);
-}
+    if (!existing) {
+      db.prepare(
+        `INSERT INTO model_provider_configs
+           (providerConfigId, projectId, role, providerKind, baseUrl, modelId, apiKeyRef, reasoningEffort, maxTokens, temperature, createdAt, updatedAt)
+         VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)`,
+      ).run(randomUUID(), spec.role, spec.providerKind, spec.baseUrl, spec.modelId, apiKeyRef, spec.reasoningEffort, spec.maxTokens, now, now);
+      continue;
+    }
 
-function syncProjectProviderConfigsFromGlobal(db: DatabaseInstance): void {
-  const globalConfigs = db
-    .prepare(
-      `SELECT role, providerKind, baseUrl, modelId, apiKeyRef
-       FROM model_provider_configs
-       WHERE projectId IS NULL AND role IN ('formalizer', 'auxiliary')`,
-    )
-    .all() as Array<Pick<ProviderConfigRow, 'role' | 'providerKind' | 'baseUrl' | 'modelId' | 'apiKeyRef'>>;
-
-  const now = new Date().toISOString();
-  for (const { role, providerKind, baseUrl, modelId, apiKeyRef } of globalConfigs) {
+    // Project-scoped rows are updated too — a stale one would otherwise keep
+    // sending that project's runs to a removed provider.
     db.prepare(
       `UPDATE model_provider_configs
        SET providerKind = ?,
            baseUrl = ?,
            modelId = ?,
            apiKeyRef = ?,
+           reasoningEffort = ?, maxTokens = ?, temperature = NULL,
+           updatedAt = ?
+       WHERE role = ?`,
+    ).run(spec.providerKind, spec.baseUrl, spec.modelId, apiKeyRef, spec.reasoningEffort, spec.maxTokens, now, spec.role);
+  }
+}
+
+function syncProjectProviderConfigsFromGlobal(db: DatabaseInstance): void {
+  const globalConfigs = db
+    .prepare(
+      `SELECT role, providerKind, baseUrl, modelId, apiKeyRef, reasoningEffort, maxTokens, temperature
+       FROM model_provider_configs
+       WHERE projectId IS NULL AND role IN ('proposer', 'formalizer', 'auxiliary')`,
+    )
+    .all() as Array<Pick<ProviderConfigRow, 'role' | 'providerKind' | 'baseUrl' | 'modelId' | 'apiKeyRef' | 'reasoningEffort' | 'maxTokens' | 'temperature'>>;
+
+  const now = new Date().toISOString();
+  for (const { role, providerKind, baseUrl, modelId, apiKeyRef, reasoningEffort, maxTokens, temperature } of globalConfigs) {
+    db.prepare(
+      `UPDATE model_provider_configs
+       SET providerKind = ?,
+           baseUrl = ?,
+           modelId = ?,
+           apiKeyRef = ?,
+           reasoningEffort = ?, maxTokens = ?, temperature = ?,
            updatedAt = ?
        WHERE projectId IS NOT NULL AND role = ?`,
-    ).run(providerKind, baseUrl, modelId, apiKeyRef, now, role);
+    ).run(providerKind, baseUrl, modelId, apiKeyRef, reasoningEffort, maxTokens, temperature, now, role);
   }
 }
 
@@ -1403,25 +1413,57 @@ function syncProjectProviderConfigsFromGlobal(db: DatabaseInstance): void {
 // Utilities
 // ---------------------------------------------------------------------------
 
+// A whole LaTeX document arrives in a snapshot, so the ceiling is generous —
+// but unbounded accumulation is how one malformed client takes the service's
+// memory with it, and the loopback binding is not a reason to skip the check.
+const MAX_REQUEST_BYTES = 16 * 1024 * 1024;
+
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let body = '';
+    let bytes = 0;
     req.setEncoding('utf8');
-    req.on('data', (chunk: string) => { body += chunk; });
+    req.on('data', (chunk: string) => {
+      bytes += Buffer.byteLength(chunk, 'utf8');
+      if (bytes > MAX_REQUEST_BYTES) {
+        req.destroy();
+        reject(new Error(`Request body exceeds ${MAX_REQUEST_BYTES} bytes`));
+        return;
+      }
+      body += chunk;
+    });
     req.on('end', () => resolve(body));
     req.on('error', reject);
   });
 }
 
+/** Null for anything unreadable, so callers answer 400 rather than 500. */
 async function readJson(req: IncomingMessage): Promise<unknown> {
-  const body = await readBody(req);
-  try { return JSON.parse(body); } catch { return null; }
+  try { return JSON.parse(await readBody(req)); } catch { return null; }
 }
 
 function sendJson(res: ServerResponse, status: number, value: unknown): void {
   if (res.headersSent) return;
   res.writeHead(status, { 'content-type': 'application/json' });
   res.end(JSON.stringify(value));
+}
+
+// Projects created by earlier builds froze the then-current Lean and Mathlib
+// versions into their settings. The provisioned toolchain is the source of
+// truth now, so drop the copies rather than let them shadow it.
+function dropPinnedVersionsFromProjectSettings(db: DatabaseInstance): void {
+  const rows = db
+    .prepare('SELECT projectId, settingsJson FROM projects')
+    .all() as Array<{ projectId: string; settingsJson: string }>;
+
+  for (const row of rows) {
+    const settings = parseSettings(row.settingsJson);
+    if (!('leanVersion' in settings) && !('mathlibRevision' in settings)) continue;
+    delete settings['leanVersion'];
+    delete settings['mathlibRevision'];
+    db.prepare('UPDATE projects SET settingsJson = ? WHERE projectId = ?')
+      .run(JSON.stringify(settings), row.projectId);
+  }
 }
 
 function parseSettings(settingsJson: string): Record<string, unknown> {

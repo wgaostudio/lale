@@ -1,0 +1,347 @@
+/*
+ * @lale/ui base layer — element defaults and primitive classes.
+ * Import after tokens.css. Framework-agnostic; the React primitives in
+ * components.tsx are thin wrappers over these class names.
+ */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  color: var(--lale-ink);
+  background: var(--lale-surface);
+  font-family: var(--lale-font-sans);
+  font-size: var(--lale-text-base);
+  line-height: var(--lale-leading);
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  margin: 0;
+  background: var(--lale-surface);
+}
+
+h1,
+h2,
+h3,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: var(--lale-text-lg);
+  font-weight: var(--lale-weight-bold);
+  letter-spacing: var(--lale-track-tight);
+}
+
+h2 {
+  font-size: var(--lale-text-md);
+  font-weight: var(--lale-weight-medium);
+  letter-spacing: var(--lale-track-tight);
+}
+
+code,
+pre,
+.lale-mono {
+  font-family: var(--lale-font-mono);
+  font-size: var(--lale-text-sm);
+}
+
+pre {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-x: auto;
+  line-height: var(--lale-leading);
+}
+
+code {
+  background: var(--lale-surface-sunken);
+  padding: 0 3px;
+}
+
+:focus-visible {
+  outline: none;
+  box-shadow: var(--lale-focus-ring);
+}
+
+/* --- Text ------------------------------------------------------------- */
+
+/* Wide-tracked uppercase section label. The counterweight to tight headings. */
+.lale-label {
+  display: block;
+  color: var(--lale-ink-muted);
+  font-size: var(--lale-text-xs);
+  font-weight: var(--lale-weight-medium);
+  letter-spacing: var(--lale-track-label);
+  text-transform: uppercase;
+}
+
+/* Descriptive prose, not row subtitles — those set their own tighter leading.
+ * At 11px, 1.25 leading reads as a solid block; 1.45 lets it breathe. */
+.lale-muted {
+  color: var(--lale-ink-muted);
+  font-size: var(--lale-text-sm);
+  line-height: var(--lale-leading);
+}
+
+.lale-truncate {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* --- Structure --------------------------------------------------------
+ * A hairline rule separating sections, replacing the old bordered cards. */
+
+.lale-rule {
+  height: 1px;
+  border: 0;
+  margin: 0;
+  background: var(--lale-line);
+}
+
+.lale-section {
+  padding: var(--lale-space-6) 0;
+  border-top: 1px solid var(--lale-line);
+}
+
+.lale-section:first-child {
+  border-top: 0;
+}
+
+.lale-section > .lale-label {
+  margin-bottom: var(--lale-space-5);
+}
+
+/* A panel is square and sits on the sunken surface — used sparingly, for
+ * genuinely inset content like the provisioning log or a token field. */
+.lale-panel {
+  background: var(--lale-surface-sunken);
+  border: 1px solid var(--lale-line);
+  border-radius: var(--lale-radius-none);
+  padding: var(--lale-space-5);
+}
+
+/* --- Status ----------------------------------------------------------- */
+
+.lale-dot {
+  display: inline-block;
+  flex: none;
+  width: 6px;
+  height: 6px;
+  border-radius: var(--lale-radius-pill);
+  background: var(--lale-idle-mark);
+}
+
+.lale-dot[data-tone='ok'] { background: var(--lale-ok-mark); }
+.lale-dot[data-tone='warn'] { background: var(--lale-warn-mark); }
+.lale-dot[data-tone='bad'] { background: var(--lale-bad-mark); }
+
+/* Running work pulses rather than spins — cheaper, and calmer in a panel
+ * that may show several at once. */
+.lale-dot[data-pulse='true'] {
+  animation: lale-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes lale-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.35; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lale-dot[data-pulse='true'] { animation: none; }
+}
+
+.lale-status {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--lale-space-3);
+  color: var(--lale-ink-muted);
+  font-size: var(--lale-text-xs);
+  font-weight: var(--lale-weight-medium);
+  letter-spacing: var(--lale-track-label);
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.lale-status[data-tone='ok'] { color: var(--lale-ok-ink); }
+.lale-status[data-tone='warn'] { color: var(--lale-warn-ink); }
+.lale-status[data-tone='bad'] { color: var(--lale-bad-ink); }
+
+/* Pill — the one rounded shape in the system. Carries a count or a kind,
+ * never a status (statuses read as dot + label). */
+.lale-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--lale-space-2);
+  border: 1px solid var(--lale-line-strong);
+  border-radius: var(--lale-radius-pill);
+  padding: 1px var(--lale-space-4);
+  color: var(--lale-ink-soft);
+  font-size: var(--lale-text-xs);
+  letter-spacing: var(--lale-track-normal);
+  white-space: nowrap;
+}
+
+/* --- Controls ---------------------------------------------------------- */
+
+.lale-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--lale-space-3);
+  min-height: 30px;
+  padding: 0 var(--lale-space-5);
+  border: 1px solid var(--lale-ink);
+  border-radius: var(--lale-radius-pill);
+  background: var(--lale-surface);
+  color: var(--lale-ink);
+  font: inherit;
+  font-size: var(--lale-text-sm);
+  letter-spacing: var(--lale-track-normal);
+  cursor: pointer;
+}
+
+.lale-button:hover:not(:disabled) {
+  background: var(--lale-ink);
+  color: var(--lale-surface);
+}
+
+.lale-button[data-variant='primary'] {
+  background: var(--lale-ink);
+  color: var(--lale-surface);
+}
+
+.lale-button[data-variant='primary']:hover:not(:disabled) {
+  background: var(--lale-ink-soft);
+}
+
+.lale-button[data-variant='quiet'] {
+  border-color: transparent;
+  color: var(--lale-ink-muted);
+  padding-left: var(--lale-space-3);
+  padding-right: var(--lale-space-3);
+}
+
+.lale-button[data-variant='quiet']:hover:not(:disabled) {
+  background: var(--lale-surface-raised);
+  color: var(--lale-ink);
+}
+
+.lale-button:disabled {
+  border-color: var(--lale-line-strong);
+  color: var(--lale-ink-faint);
+  cursor: not-allowed;
+}
+
+/* Square icon button, for topbar affordances. */
+.lale-icon-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  padding: 0;
+  border: 0;
+  border-radius: var(--lale-radius-none);
+  background: transparent;
+  color: var(--lale-ink-muted);
+  font: inherit;
+  font-size: var(--lale-text-md);
+  line-height: 1;
+  cursor: pointer;
+}
+
+.lale-icon-button:hover:not(:disabled) {
+  background: var(--lale-surface-raised);
+  color: var(--lale-ink);
+}
+
+.lale-input,
+.lale-textarea {
+  width: 100%;
+  min-height: 30px;
+  border: 1px solid var(--lale-line-strong);
+  border-radius: var(--lale-radius-none);
+  background: var(--lale-surface);
+  color: var(--lale-ink);
+  font: inherit;
+  padding: var(--lale-space-3) var(--lale-space-4);
+}
+
+.lale-textarea {
+  resize: vertical;
+  min-height: 64px;
+}
+
+.lale-input.lale-mono,
+.lale-textarea.lale-mono {
+  font-family: var(--lale-font-mono);
+}
+
+.lale-input::placeholder,
+.lale-textarea::placeholder {
+  color: var(--lale-ink-faint);
+}
+
+.lale-input:focus,
+.lale-textarea:focus {
+  outline: none;
+  border-color: var(--lale-ink);
+  box-shadow: none;
+}
+
+/* --- Rows -------------------------------------------------------------
+ * The workhorse. Claims, dependencies and issues are all hairline-separated
+ * rows rather than nested cards. */
+
+.lale-row {
+  display: grid;
+  grid-template-columns: 12px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--lale-space-4);
+  width: 100%;
+  padding: var(--lale-space-4) var(--lale-space-2);
+  border: 0;
+  border-top: 1px solid var(--lale-line);
+  border-radius: var(--lale-radius-none);
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.lale-row:first-of-type {
+  border-top: 0;
+}
+
+.lale-row:hover:not(:disabled) {
+  background: var(--lale-surface-sunken);
+}
+
+.lale-row[data-selected='true'] {
+  background: var(--lale-surface-sunken);
+  box-shadow: inset 2px 0 0 var(--lale-ink);
+}
+
+.lale-row-main {
+  min-width: 0;
+}
+
+.lale-row-title {
+  display: block;
+  font-size: var(--lale-text-base);
+  font-weight: var(--lale-weight-medium);
+  letter-spacing: var(--lale-track-tight);
+}
+
+.lale-row-sub {
+  display: block;
+  margin-top: var(--lale-space-1);
+  color: var(--lale-ink-muted);
+  font-size: var(--lale-text-sm);
+}

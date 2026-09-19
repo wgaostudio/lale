@@ -1,7 +1,7 @@
-import type { ParsedClaim, ParsedDocument } from '@lale/document-parser';
+import type { ParsedDocument } from '@lale/document-parser';
 
 // ---------------------------------------------------------------------------
-// Audit graph node/edge types (§3.3)
+// Audit graph node types (§3.3)
 // ---------------------------------------------------------------------------
 
 export type AuditNodeKind =
@@ -22,20 +22,14 @@ export interface AuditNode {
   endLine: number;
 }
 
-export type EdgeKind = 'explicitRef' | 'proofAttachment' | 'context' | 'external';
-export type TrustStatus = 'unverified' | 'verified' | 'trusted' | 'missing' | 'stale';
-
-export interface AuditEdge {
-  fromId: string;
-  toId: string;
-  kind: EdgeKind;
-  label?: string;
-  trustStatus: TrustStatus;
-}
-
+/**
+ * Nodes only. Dependency traversal reads `ParsedClaim.dependencies` directly —
+ * the parser has already resolved labels to claims and reported the ambiguous
+ * and unresolved ones as issues, so a second edge list here was built on every
+ * run and never read.
+ */
 export interface AuditGraph {
   nodes: Map<string, AuditNode>;
-  edges: AuditEdge[];
 }
 
 // ---------------------------------------------------------------------------
@@ -43,6 +37,7 @@ export interface AuditGraph {
 // ---------------------------------------------------------------------------
 
 export interface ResolvedDependency {
+  fingerprint: string;
   label: string;
   kind: AuditNodeKind;
   statementText: string;
@@ -55,6 +50,8 @@ export interface NormalizedClaimContext {
   targetLabel: string | null;
   targetKind: string;
   statementText: string;
+  /** Standing hypotheses from the prose around the claim (see ParsedClaim). */
+  ambientContext: string;
   proofText: string | null;
   resolvedDependencies: ResolvedDependency[];
   unresolvedDependencyLabels: string[];
@@ -89,15 +86,7 @@ export function buildAuditGraph(doc: ParsedDocument): AuditGraph {
     });
   }
 
-  const edges: AuditEdge[] = doc.edges.map((e) => ({
-    fromId: e.from,
-    toId: e.to,
-    kind: 'explicitRef',
-    label: e.label,
-    trustStatus: 'unverified',
-  }));
-
-  return { nodes, edges };
+  return { nodes };
 }
 
 // ---------------------------------------------------------------------------
@@ -116,30 +105,31 @@ export function selectReachableContext(
     throw new Error(`Target claim not found: ${targetId}`);
   }
 
-  // BFS upstream through explicit references. The queue contains labels because
-  // ParsedClaim dependencies are stored as LaTeX labels.
+  // DFS produces a true dependency-first order; reversing BFS is not a
+  // topological sort for diamonds and cross edges.
   const reachableLabels: string[] = [];
-  const seenLabels = new Set<string>();
-  const queue = [...targetClaim.dependencies];
-  while (queue.length > 0) {
-    const next = queue.shift()!;
-    if (seenLabels.has(next)) continue;
-    seenLabels.add(next);
-    reachableLabels.push(next);
-    const node = findNodeByLabel(graph, next);
-    if (node) {
-      const claim = doc.claims.find((c) => c.id === node.id);
-      if (claim) queue.push(...claim.dependencies);
-    }
+  const visited = new Set<string>(), visiting = new Set<string>();
+  function visit(label: string): void {
+    if (visiting.has(label) || label === targetClaim!.label) throw new Error(`Dependency cycle at ${label}`);
+    if (visited.has(label)) return;
+    visiting.add(label);
+    const matches = doc.claims.filter(c => c.label === label);
+    if (matches.length > 1) throw new Error(`Ambiguous dependency: ${label}`);
+    for (const child of matches[0]?.dependencies ?? []) visit(child);
+    visiting.delete(label);
+    visited.add(label);
+    reachableLabels.push(label);
   }
+  for (const label of targetClaim.dependencies) visit(label);
 
   const resolvedDependencies: ResolvedDependency[] = [];
   const unresolvedDependencyLabels: string[] = [];
 
-  for (const label of [...reachableLabels].reverse()) {
+  for (const label of reachableLabels) {
     const depNode = findNodeByLabel(graph, label);
     if (depNode) {
       resolvedDependencies.push({
+        fingerprint: doc.claims.find(c => c.label === label)!.fingerprint,
         label,
         kind: depNode.kind,
         statementText: depNode.statementText,
@@ -160,6 +150,7 @@ export function selectReachableContext(
     targetLabel: targetClaim.label,
     targetKind: targetClaim.kind,
     statementText: targetClaim.statement,
+    ambientContext: targetClaim.ambientContext,
     proofText: targetClaim.proof?.text ?? null,
     resolvedDependencies,
     unresolvedDependencyLabels,
@@ -184,7 +175,7 @@ export function formatDependencyDeclarations(deps: ResolvedDependency[]): string
     .map((d) =>
       d.leanDeclaration
         ? d.leanDeclaration
-        : `-- ${d.label}: ${d.statementText}`,
+        : `-- ${d.label}: ${d.statementText.replace(/\r?\n/g, '\n-- ')}`,
     )
     .join('\n');
 }
@@ -202,9 +193,14 @@ export function buildEnvironmentFingerprint(
   return JSON.stringify({
     leanVersion,
     mathlibRevision,
+    // Ambient hypotheses are part of what the claim means, so editing them must
+    // invalidate cached results for the claims that inherit them.
+    ambientContext: context.ambientContext,
     deps: context.resolvedDependencies.map((d) => ({
       label: d.label,
       statementText: d.statementText,
+      fingerprint: d.fingerprint,
+      leanDeclaration: d.leanDeclaration,
     })),
     unresolvedDeps: context.unresolvedDependencyLabels,
   });

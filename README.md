@@ -1,309 +1,126 @@
-# lale-next
+# lale
 
-Local-first Lean verification for Overleaf.
+Lean verification for Overleaf.
 
-`lale-next` is the clean product repo for lale. It pairs a Chrome MV3
-extension with a local desktop companion service: the extension reads the
-Overleaf document and shows status, while the desktop service owns durable
-state, model configuration, Lean/Mathlib provisioning, audit runs, and the
-SQLite-backed verification cache.
+lale reads the theorem environments in an Overleaf document, formalizes them in
+Lean 4 with Mathlib, and checks them on your own machine. Nothing is verified in
+the cloud: a local service runs Lean, and the only thing that leaves the machine
+is the relevant claim, proof, surrounding hypotheses, and dependency context,
+sent to the model provider under your own API key.
 
-The previous hackathon implementation at `https://github.com/Defying-gravity62442/lale` is kept
-as a reference implementation.
+## What a result means
 
-## What It Does
+This distinction matters more than any other in the project, so it comes first.
 
-- Parses an Overleaf LaTeX document into claims, adjacent proofs, explicit
-  references, document issues, and a dependency graph.
-- Sends verification requests from the extension to a localhost desktop API.
-- Runs an auditor pipeline:
-  parse snapshot -> build graph -> select context -> informal advisory ->
-  formalize statement -> `sorry` check -> faithfulness checks -> freeze header
-  -> proof attempt -> final gate.
-- Provisions Lean and Mathlib locally through `elan` and `lake exe cache get`.
-- Stores projects, snapshots, claim revisions, run events, overrides, provider
-  config, and cache records in `~/.lale/lale.db`.
-- Stores provider API keys outside the extension, either in environment
-  variables or the OS keychain via `keytar`.
+| Mode | What it does | What a pass means |
+|---|---|---|
+| **Verify** (`full`) | Formalizes the statement, then asks a model to write a Lean proof of it. | The theorem is true in Lean + Mathlib. **Your written proof was not audited** — the model may close the goal by an entirely different route. |
+| **Formalize only** | Formalizes the statement and runs the faithfulness checks. No proof attempt. | The statement can be expressed precisely and the formalization matches your prose. Cheap, and the fastest way to find ambiguity. |
+| **Check proof steps** (`proofSkeleton`) | Splits *your* proof into the steps it argues, states each in Lean under the theorem's hypotheses, proves each, then checks they compose. | Your argument holds up, step by step — and a gap is localised to a step. |
 
-The extension is intentionally a mirror. It may keep lightweight UI state in
-`chrome.storage.local`, but the desktop service is the source of truth.
+Lean's kernel is the thing that proves. The model that writes candidate proofs is
+called the **proposer**, because proposing is what it does; a rejected proposal
+says the model failed, not that the theorem is false.
 
-## Repository Layout
+## Layout
 
-| Path | Purpose |
-| --- | --- |
-| `apps/extension` | Chrome MV3 extension for Overleaf, built with Vite and `@crxjs/vite-plugin`. |
-| `apps/desktop` | Node/TypeScript localhost service, SQLite schema, auth, provisioning, SSE, and auditor pipeline. |
-| `packages/protocol` | Zod schemas for the versioned extension-to-desktop wire protocol. |
-| `packages/overleaf-adapter` | Overleaf/CodeMirror document capture and source navigation adapter. |
-| `packages/document-parser` | LaTeX claim parser, proof adjacency detection, package/issues detection, and explicit-reference graph builder. |
-| `packages/translator` | OpenAI-compatible model client and formalization, backtranslation, re-formalization, proof, and informal-audit prompts. |
-| `packages/lean-runner` | Lean subprocess executor with wall-clock cap, memory cap, diagnostics parser, and trust-policy scan. |
-| `packages/cache` | SQLite-backed Lean check cache keyed by normalized goal/environment/Lean/Mathlib, not source text. |
-| `docs` | Design specs and extension flow notes. |
-| `evals` | Small repeatable evaluation fixtures. |
+```
+apps/extension     Chrome MV3 extension: side panel, Overleaf content script
+apps/desktop       The service: HTTP API on 127.0.0.1:8765, pipeline, Lean runner
+apps/desktop-app   macOS menu-bar shell (Electron) that packages the service
+packages/document-parser   LaTeX → claims, dependencies, ambient hypotheses
+packages/lean-runner       Runs Lean, parses diagnostics, checks axioms
+packages/translator        Model client, prompts, token budget
+packages/protocol          Shared wire types (zod)
+packages/cache             Proof cache keyed on goal + environment + toolchain
+packages/ui                Shared UI primitives
+```
 
-## Prerequisites
+## Requirements
 
-- Node.js `>=20.10`
-- pnpm `>=9`
-- Chrome or Chromium with extension developer mode enabled
-- Model API keys for:
-  - formalizer/prover model, defaulting to DeepSeek Prover V2 671B on Novita
-  - auxiliary model, defaulting to OpenRouter `openai/gpt-chat-latest`
+- macOS (the app shell is macOS-only; the service itself is portable)
+- Node ≥ 22 and pnpm ≥ 12 — `packageManager` pins pnpm 12.4.2, and pnpm will
+  switch to it automatically
+- ~11 GB free disk for Lean and Mathlib, downloaded on first provision
+- An OpenRouter account with credit
 
-Lean and Mathlib do not need to be installed by hand. The desktop service can
-provision them into `~/.lale/lean-project` through the side panel or HTTP API.
+## Development
 
-## Setup
-
-Install dependencies:
-
-```sh
+```bash
 pnpm install
+pnpm desktop:dev      # service on 127.0.0.1:8765, logging to ~/Library/Logs/lale/
+pnpm build:ext        # then load apps/extension/dist as an unpacked extension
+pnpm typecheck        # tsc across every package; there is no linter
+pnpm test             # offline regression tests; no model calls or Lean install
+pnpm evals            # validate the bundled evaluation fixtures (no paid calls)
 ```
 
-Start the desktop service:
+In a terminal the service approves its own pairing requests and says so in the
+log. The packaged app asks you instead.
 
-```sh
-pnpm --filter @lale/desktop dev
+## Building the app and the extension package
+
+```bash
+pnpm --filter @lale/desktop-app dist       # → apps/desktop-app/release/lale-<version>-arm64.dmg
+pnpm --filter @lale/extension pack:store   # → apps/extension/release/lale-extension-<version>.zip
 ```
 
-On startup it prints the localhost port, database path, Lean project path, and
-the extension connection bearer token:
+The DMG is unsigned. macOS blocks a first launch: **System Settings → Privacy &
+Security → Open Anyway**. Signing it properly needs an Apple Developer ID and
+notarization; see `docs/chrome-web-store.md` for the extension's review path.
 
-```text
-lale desktop service starting
-Port:        8765
-DB:          /Users/<you>/.lale/lale.db
-Lean project: /Users/<you>/.lale/lean-project
+## How the pieces talk
 
-Extension connection token (paste into extension settings):
-  <token>
-```
+The extension asks the service to pair; the app shows a prompt; on approval the
+bearer token travels back over that request. The token is stored by the
+extension and never typed by hand. Only an extension origin that has completed a
+pairing is accepted afterwards — an unpaired one is refused even with a valid
+token, since an `Origin` header is not evidence when any local process can set
+one.
 
-Build the extension:
+## Where state lives
 
-```sh
-pnpm --filter @lale/extension build
-```
+- `~/.lale/lale.db` — projects, runs, claims, proof cache, the bearer token
+- `~/.lale/lean-project` — the Lean project, Mathlib and its build artifacts
+- `~/.elan` — the Lean toolchain (installed by provisioning)
+- `~/Library/Logs/lale/desktop.log` — service and provisioning log
+- OS keychain, service `lale` — your model provider API key
 
-Load it in Chrome:
+## Costs
 
-1. Open `chrome://extensions`.
-2. Enable Developer mode.
-3. Click "Load unpacked".
-4. Select `apps/extension/dist`.
-5. Open an Overleaf project at `https://www.overleaf.com/project/...`.
-6. Open the lale side panel and paste the token printed by the desktop service.
+Runs are metered in tokens against a per-run cap, and priced from the provider's
+published rates before the first request. Roughly **$0.20-$2 per claim**, with a
+$12.50 ceiling per run at the default 250k-token cap. A run refuses to start if
+the account cannot cover a single worst-case request.
 
-Configure model keys in the extension Settings UI. The side panel exposes the
-supported formalizer choices and auxiliary OpenRouter key; saved keys are sent
-to the desktop service and stored via the desktop keychain integration, not in
-the extension.
+## Validation and known gaps
 
-Environment variables are still supported for local development and CI-style
-server bootstrapping. They are optional when keys are configured through
-Settings:
+Parser 0.4.0 widened the fingerprint hash from 32 to 128 bits — it decides
+cache reuse and staleness, and 8 hex digits was a thin margin. Every stored
+fingerprint therefore changed, so claims accepted under 0.3.0 need rerunning
+before reuse. New runs persist their selected mode across a pause; historic runs
+without a stored mode default to `full`.
 
-```sh
-export LALE_NOVITA_API_KEY=...
-export LALE_OPENROUTER_API_KEY=...
-```
-
-Optional provider/model overrides for the desktop process:
-
-```sh
-# Default formalizer
-export LALE_FORMALIZER_BASE_URL=https://api.novita.ai/openai
-export LALE_FORMALIZER_MODEL=deepseek/deepseek-prover-v2-671b
-
-# Alternative: Goedel Prover V2 32B on Featherless
-export LALE_FEATHERLESS_API_KEY=...
-export LALE_FORMALIZER_BASE_URL=https://api.featherless.ai/v1
-export LALE_FORMALIZER_MODEL=Goedel-LM/Goedel-Prover-V2-32B
-```
-
-For extension development with Vite:
-
-```sh
-pnpm --filter @lale/extension dev
-```
-
-## Provision Lean + Mathlib
-
-The default toolchain is Lean `4.20.0` with Mathlib `v4.20.0`. These defaults
-avoid the macOS 15 dyld issue affecting older Lean binaries and match a tagged
-Mathlib revision with community cache coverage.
-
-From the extension:
-
-1. Open Settings.
-2. In "Lean + Mathlib", click "Install Lean + Mathlib".
-3. Watch the streamed provisioning log.
-
-From curl:
-
-```sh
-TOKEN=<token from desktop startup>
-
-curl -s -X POST http://127.0.0.1:8765/v1/provision \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "content-type: application/json" \
-  -d '{"protocolVersion":1}'
-```
-
-Then stream events from the returned `provisionId`:
-
-```sh
-curl -N -H "Authorization: Bearer $TOKEN" \
-  http://127.0.0.1:8765/v1/provision/<provisionId>/events
-```
-
-Provisioning creates a local Lake project under `~/.lale/lean-project` unless
-`LALE_LEAN_PROJECT_DIR` is set.
-
-## Verification Flow
-
-1. The content script captures the current Overleaf CodeMirror document and
-   parses it with `@lale/document-parser`.
-2. The side panel shows package/issues, dependency graph, and claim list.
-3. If the Overleaf project is not linked, the user creates a local lale project.
-4. Clicking Verify sends `POST /v1/verify` with the snapshot, parser version,
-   document fingerprint, project id, and claim id.
-5. The desktop service creates an audit run and immediately returns an accepted
-   response with `runId`.
-6. The extension streams `GET /v1/runs/:runId/events` and updates the claim UI.
-7. The final `complete` SSE event carries the verification outcome.
-
-Supported claim environments are `theorem`, `proposition`, `claim`, `lemma`,
-`corollary`, `definition`, `postulate`, and `axiom`. Proofs are required for
-verifiable theorem-like claims and optional for definitions, postulates, and
-axioms. Dependencies come only from explicit `\ref`, `\cref`, `\Cref`,
-`\autoref`, and `\eqref` references. There is no LLM fallback for dependency
-discovery.
-
-## Verifier Outcomes
-
-The final run result uses `VerificationOutcome` from `packages/protocol`.
-
-| Outcome | Meaning |
-| --- | --- |
-| `verified` | The statement was formalized, the proof was accepted by Lean, and the final gate passed. |
-| `formalized` | A proof-optional item, such as a definition, was faithfully formalized and accepted without a proof attempt. |
-| `malformedClaim` | The claim could not be translated into a well-typed Lean statement after retries. |
-| `malformedProof` | A proof was required but no adjacent proof text reached the prover. |
-| `claimContradicted` | Reserved outcome for claim-level contradiction classification. |
-| `proofContradicted` | Reserved outcome for proof-level contradiction classification. |
-| `proofIncomplete` | Lean saw unsolved goals after the allowed proof retries; the proof appears incomplete. |
-| `proofDoesNotSupportClaim` | Faithfulness or final-gate checks found that the formal/proved content does not support the original claim. |
-| `formalizationUnfaithful` | A proof-optional item was formalized, but the formalization failed faithfulness checks. |
-| `dependencyMissing` | An explicit referenced dependency could not be resolved or prepared for the target claim. |
-| `verificationBlocked` | Verification could not complete because of infrastructure, model, timeout, trust-policy, budget, or restart interruption. |
-
-In the current prover loop, proof attempts that repeatedly fail with
-syntax/elaboration/type errors finish as `verificationBlocked`; attempts that
-reach Lean but leave unsolved goals finish as `proofIncomplete`.
-
-## Informal Advisory
-
-Every run includes an auxiliary informal advisory pass before formalization.
-The advisory can report `noObviousIssue`, `possibleTypo`, `possibleGap`,
-`possibleContradiction`, `possibleClaimProofMismatch`, or `uncertain`.
-
-Low- and medium-confidence findings are warning-only. High-confidence issue
-findings pause the run at `informalAudit`; the user must acknowledge the
-advisory with a reason before the same run resumes. The advisory does not
-decide the final verification outcome.
-
-## Local API
-
-The desktop service listens on `http://127.0.0.1:8765` by default. Except for
-health checks, routes require `Authorization: Bearer <token>`.
-
-| Method | Route | Purpose |
-| --- | --- | --- |
-| `GET` | `/v1/health` | Lean/cache health. |
-| `POST` | `/v1/projects/lookup` | Resolve an Overleaf project to a local project and claim statuses. |
-| `POST` | `/v1/projects` | Create a local project. |
-| `GET` | `/v1/projects/:id` | Fetch project metadata. |
-| `POST` | `/v1/projects/:id/overrides` | Record content-change override. |
-| `POST` | `/v1/verify` | Start a verification run. |
-| `GET` | `/v1/runs/:id` | Fetch final/current run result. |
-| `GET` | `/v1/runs/:id/events` | Stream run events over SSE. |
-| `POST` | `/v1/runs/:id/informal-audit/acknowledge` | Record advisory acknowledgement and resume if paused. |
-| `GET` | `/v1/provider-configs` | List model provider config summaries. |
-| `PATCH` | `/v1/provider-configs/:id` | Switch active formalizer config. |
-| `PUT` | `/v1/provider-keys/:provider` | Store a named provider key in keychain. |
-| `DELETE` | `/v1/provider-keys/:provider` | Clear a named provider key. |
-| `PUT` | `/v1/provider-configs/:id/key` | Store a provider-config key in keychain. |
-| `DELETE` | `/v1/provider-configs/:id/key` | Clear a provider-config key. |
-| `POST` | `/v1/provision` | Start Lean/Mathlib provisioning. |
-| `GET` | `/v1/provision` | Fetch provisioning state. |
-| `GET` | `/v1/provision/:id/events` | Stream provisioning events over SSE. |
-
-## Development Commands
-
-```sh
-pnpm --filter @lale/desktop dev       # run localhost desktop service
-pnpm --filter @lale/extension dev     # run extension dev build
-pnpm --filter @lale/extension build   # build extension into apps/extension/dist
-pnpm typecheck                        # typecheck all workspaces
-pnpm lint                             # alias for workspace TypeScript checks
-pnpm --filter @lale/translator evals  # run translator eval harness
-```
-
-## Useful Environment Variables
-
-| Variable | Purpose |
-| --- | --- |
-| `PORT` | Desktop service port, default `8765`. |
-| `LALE_LEAN_PROJECT_DIR` | Lean/Lake project directory, default `~/.lale/lean-project`. |
-| `LALE_MODEL_TIMEOUT_MS` | Model request timeout, default `90000`. |
-| `LALE_FORMALIZER_BASE_URL` | OpenAI-compatible formalizer endpoint. |
-| `LALE_FORMALIZER_MODEL` | Formalizer/prover model id. |
-| `LALE_NOVITA_API_KEY` | API key for the default Novita formalizer. |
-| `LALE_FEATHERLESS_API_KEY` | API key for Featherless formalizer option. |
-| `LALE_AUXILIARY_BASE_URL` | Auxiliary endpoint. |
-| `LALE_AUXILIARY_MODEL` | Auxiliary model id. |
-| `LALE_OPENROUTER_API_KEY` | API key for the default auxiliary provider. |
-| `LALE_API_KEY` | Last-resort generic API key fallback. |
-
-See `.env.example` for the common model-provider setup.
-
-## Data Locations
-
-- SQLite database: `~/.lale/lale.db`
-- Lean project: `~/.lale/lean-project`
-- Extension token storage: `chrome.storage.local["lale.bearerToken"]`
-- Provider keys: environment variables or OS keychain refs such as
-  `lale:novita.ai`, `lale:featherless.ai`, and `lale:openrouter.ai`
-
-## Troubleshooting
-
-- **Side panel stays on Connect**: the token is missing or stale. Restart the
-  desktop service and paste the current token from the terminal.
-- **Desktop reachable but token rejected**: clear the token in Settings and
-  paste the current startup token.
-- **Verification fails immediately**: check that the project is linked, Lean is
-  provisioned, and both formalizer and auxiliary keys are configured.
-- **Provisioning fails during `lake exe cache get`**: the Mathlib revision may
-  not have community cache coverage. Use a tagged revision that matches the
-  Lean toolchain.
-- **Extension sees no claims**: reload the Overleaf tab after loading the
-  extension. The content script only runs on
-  `https://www.overleaf.com/project/*`.
-- **A theorem is ignored or blocked**: add a stable `\label{...}` and place the
-  proof immediately after the claim.
-
-## Design Constraints
-
-- API keys never live in the extension.
-- The desktop app owns project state, verification history, overrides, model
-  keys, and cache records.
-- Claim dependencies are explicit LaTeX references only.
-- Cache keys are based on normalized goal term, environment fingerprint, Lean
-  version, and Mathlib revision.
-- Final proofs are rejected if the trust-policy scan finds `sorry`, `admit`,
-  `unsafe`, `#eval`, `native_decide`, `IO`, custom `axiom`, or `opaque`.
+- Offline tests cover database migrations, context fingerprints, SSE framing,
+  pipeline modes, staleness propagation, and the trust boundary — the scanner,
+  obligation parser and Lean harness that decide what reaches the kernel. Pipeline tests stub the model, Lean, and keychain; they
+  skip when the optional `keytar` module cannot load. Live Lean and browser
+  integration remain manual checks. The obsolete `test:lean` command was removed.
+- `pnpm evals` checks three bundled fixtures. Running with `--live` uses a running
+  desktop service and paid model requests, and requires `LALE_DESKTOP_TOKEN`.
+- Proof generation is generate-and-check, not proof search: one model call
+  writes a whole tactic block and Lean adjudicates. Lean's own tactic ladder is
+  tried first, for free; past that a claim gets at most four model attempts,
+  bounded separately for syntax failures and unsolved goals. There is no premise
+  selection and no tactic-level search.
+- Feasibility tracks Mathlib's coverage. Arithmetic and finite case analysis land
+  well; anything needing theory Mathlib lacks (multigraphs as multiplicity
+  functions, say) will formalize but not prove.
+- Provisioning readiness currently checks for project files and `.lake`, while
+  its final probe only checks the Lean version. A partial Mathlib install can
+  therefore appear ready after a restart.
+- Extension state is shared across Overleaf tabs. Project switches and delayed
+  responses need explicit isolation, and several UI actions discard errors.
+- Staleness propagates transitively: editing a claim marks everything that cites
+  it stale, walking the parser's resolved edges out of the stored snapshot. It
+  only reaches claims present in that snapshot's parse.

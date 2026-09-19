@@ -7,19 +7,24 @@
     "dev": "vite",
     "build": "vite build",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "tsc -p tsconfig.json --noEmit"
+    "pack:store": "pnpm build && node scripts/pack.mjs"
   },
   "dependencies": {
     "@lale/document-parser": "workspace:*",
     "@lale/overleaf-adapter": "workspace:*",
     "@lale/protocol": "workspace:*",
-    "@crxjs/vite-plugin": "2.0.0-beta.30",
-    "@vitejs/plugin-react": "^4.3.3",
+    "@lale/ui": "workspace:*",
     "katex": "^0.16.25",
-    "vite": "^6.0.0",
-    "typescript": "^5.6.3"
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
   },
   "devDependencies": {
-    "@types/chrome": "^0.0.280"
+    "@crxjs/vite-plugin": "2.0.0-beta.30",
+    "@types/chrome": "^0.0.280",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.3",
+    "typescript": "^5.6.3",
+    "vite": "^6.0.0"
   }
 }

@@ -1,14 +1,14 @@
 import { randomUUID } from 'node:crypto';
-import { createHash } from 'node:crypto';
 import type { Database } from 'better-sqlite3';
 import {
   isVerifiableClaimKind,
+  PARSER_VERSION,
   parseLatexDocument,
   type ParsedDocument,
 } from '@lale/document-parser';
 import { LeanCheckCache, deriveCacheKey, type CacheKey } from '@lale/cache';
 import { LeanRunner } from '@lale/lean-runner';
-import { ModelClient, informalAudit as runInformalAudit, type TokenUsage } from '@lale/translator';
+import { RunBudget, ModelClient, informalAudit as runInformalAudit } from '@lale/translator';
 import type { VerificationOutcome, RunPhase } from '@lale/protocol';
 import type { AuditRunRow, ProviderConfigRow } from '../db.js';
 import {
@@ -20,30 +20,32 @@ import {
   type ResolvedDependency,
 } from './context.js';
 import {
+  composeLeanFile,
   formalizeAndCheck,
   formalizeDefinitionAndCheck,
   type FormalizeProgressEvent,
   type StatementAttempt,
 } from './formalize.js';
 import { checkDefinitionFaithfulness, checkFaithfulness } from './faithfulness.js';
-import { runProver, type ProverResult } from './prover.js';
-import { runFinalGate } from './gate.js';
-import { getMathlibImportIndex } from './mathlib-index.js';
-import { apiKeyEnvNames, resolveApiKeyFromEnv } from '../model-config.js';
+import { runProposer, type ProposerResult } from './proposer.js';
+import { ACCEPTABLE_FAITHFULNESS, runFinalGate } from './gate.js';
+import { checkProofSkeleton } from './proof-steps.js';
+import { validateCachedProof } from './cache-proof.js';
+import { extractLeanImports, getMathlibImportIndex } from './mathlib-index.js';
+import type { VerificationMode } from '@lale/protocol';
+import { getAccountBalance, getModelPricing, formatUsd } from '../pricing.js';
+import { withHeartbeat } from './heartbeat.js';
+import { sha256 } from './hash.js';
 
 // ---------------------------------------------------------------------------
-// Key storage (env-var or keytar)
+// Key storage (keytar only — keys are entered in the extension settings UI)
 // ---------------------------------------------------------------------------
 
 async function resolveApiKey(config: ProviderConfigRow): Promise<string> {
-  // Env-var shortcut (for dev/testing).
-  const envKey = resolveApiKeyFromEnv(config, process.env);
-  if (envKey) return envKey.value;
-
   if (!config.apiKeyRef) {
     throw new Error(
       `No API key configured for ${config.role} model ${config.modelId}. ` +
-        `Set one of: ${apiKeyEnvNames(config).join(', ')}; or configure a provider key.`,
+        `Add your OpenRouter API key in the lale extension settings.`,
     );
   }
 
@@ -64,26 +66,8 @@ async function resolveApiKey(config: ProviderConfigRow): Promise<string> {
 // Budget tracking
 // ---------------------------------------------------------------------------
 
-interface TokenBudget {
-  capTokens: number;
-  usedInputTokens: number;
-  usedOutputTokens: number;
-}
-
-function checkBudget(budget: TokenBudget): void {
-  const used = budget.usedInputTokens + budget.usedOutputTokens;
-  if (used >= budget.capTokens) {
-    throw new BudgetExceededError(
-      `Per-run token budget exceeded (used ${used} / cap ${budget.capTokens})`,
-    );
-  }
-}
-
-class BudgetExceededError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = 'BudgetExceededError';
-  }
+function checkBudget(budget: RunBudget): void {
+  if (budget.inputTokens + budget.outputTokens >= budget.cap) throw new Error('Run token budget exhausted');
 }
 
 // ---------------------------------------------------------------------------
@@ -240,9 +224,78 @@ function emitSse(runId: string, eventName: string, data: unknown): void {
 // Build model clients from DB config rows
 // ---------------------------------------------------------------------------
 
+function heartbeatTick(emit: EventEmitter, phase: RunPhase, label: string): (elapsedMs: number) => void {
+  return (elapsedMs) =>
+    emit(phase, 'info', `${label}: still working (${Math.round(elapsedMs / 1000)}s)`, { elapsedMs });
+}
+
+function formatSpend(budget: RunBudget): string {
+  const spent = budget.spentUsd;
+  return spent === null ? '' : ` (${formatUsd(spent)})`;
+}
+
+/**
+ * Prices the run and checks the account can pay for it. Returns false only when
+ * the balance cannot cover a single worst-case request — the condition that
+ * otherwise surfaces as a 402 partway through, after earlier calls have already
+ * been billed. A balance that merely looks tight is reported, not blocked.
+ */
+async function preflightCost(
+  db: Database,
+  config: PipelineConfig,
+  budget: RunBudget,
+  emit: EventEmitter,
+): Promise<boolean> {
+  const proposerRow = db
+    .prepare('SELECT * FROM model_provider_configs WHERE providerConfigId = ?')
+    .get(config.proposerConfigId) as ProviderConfigRow | undefined;
+  if (!proposerRow) return true;
+
+  const pricing = await getModelPricing(proposerRow.baseUrl, proposerRow.modelId);
+  if (!pricing) {
+    emit('selectContext', 'info', 'Model prices unavailable; tracking tokens only');
+    return true;
+  }
+  budget.pricing = pricing;
+
+  const worstCaseUsd = budget.remainingWorstCaseUsd ?? 0;
+  // The provider holds credit against `max_tokens` for the whole request, so a
+  // single request needs the ceiling covered up front, not the average.
+  const singleRequestUsd = (proposerRow.maxTokens ?? 32_768) * pricing.completion;
+
+  let balanceNote = '';
+  try {
+    const balance = await getAccountBalance(proposerRow.baseUrl, await resolveApiKey(proposerRow));
+    if (balance) {
+      balanceNote = `, balance ${formatUsd(balance.remainingUsd)}`;
+      if (balance.remainingUsd < singleRequestUsd) {
+        emit(
+          'selectContext',
+          'error',
+          `Insufficient credit: one request reserves up to ${formatUsd(singleRequestUsd)} but the balance is ${formatUsd(balance.remainingUsd)}. Add credits at https://openrouter.ai/credits.`,
+        );
+        return false;
+      }
+    }
+  } catch {
+    // No key, no keychain, or the endpoint is down: let the run proceed and let
+    // the provider be the authority on whether it can be paid for.
+  }
+
+  emit(
+    'selectContext',
+    'info',
+    `Cost ceiling for this run: ${formatUsd(worstCaseUsd)} (${budget.cap} tokens at ${formatUsd(pricing.completion * 1_000_000)}/M output)${balanceNote}`,
+  );
+  return true;
+}
+
 async function buildModelClient(
   db: Database,
   configId: string,
+  budget: RunBudget,
+  emit: EventEmitter,
+  auditRunId: string,
 ): Promise<ModelClient> {
   const row = db
     .prepare('SELECT * FROM model_provider_configs WHERE providerConfigId = ?')
@@ -252,24 +305,35 @@ async function buildModelClient(
 
   const apiKey = await resolveApiKey(row);
 
+  // Events are attributed to whatever phase the run is in when the model
+  // answers, which can be several stages after the client was built.
+  const currentPhase = (): RunPhase => {
+    const row = db
+      .prepare('SELECT phase FROM audit_runs WHERE auditRunId = ?')
+      .get(auditRunId) as { phase: RunPhase | null } | undefined;
+    return row?.phase ?? 'complete';
+  };
+
   const clientConfig: import('@lale/translator').ModelClientConfig = {
-    apiKey,
+    apiKey, budget,
+    onNotice: message => emit(currentPhase(), 'warning', message, { model: row.modelId, role: row.role }),
+    onUsage: usage => emit(currentPhase(), 'info', 'Model request completed', { model: row.modelId, role: row.role, reasoningEffort: row.reasoningEffort, usage, totalTokens: budget.inputTokens + budget.outputTokens }),
     modelId: row.modelId,
+    ...(row.reasoningEffort ? { reasoningEffort: row.reasoningEffort } : {}),
     ...(row.baseUrl != null ? { baseURL: row.baseUrl } : {}),
     ...(row.maxTokens != null ? { maxTokens: row.maxTokens } : {}),
     ...(row.temperature != null ? { temperature: row.temperature } : {}),
     timeoutMs: modelTimeoutMs(),
-    maxRetries: 0,
   };
   return new ModelClient(clientConfig);
 }
 
 function modelTimeoutMs(): number {
   const raw = process.env['LALE_MODEL_TIMEOUT_MS'];
-  if (!raw) return 90_000;
+  if (!raw) return 600_000;
 
   const parsed = Number.parseInt(raw, 10);
-  return Number.isFinite(parsed) && parsed > 0 ? parsed : 90_000;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 600_000;
 }
 
 // ---------------------------------------------------------------------------
@@ -315,36 +379,59 @@ function upsertSnapshot(
 // Staleness propagation (§12)
 // ---------------------------------------------------------------------------
 
-function propagateStaleness(db: Database, projectId: string, changedIdentityId: string): void {
+/**
+ * Marks the changed claim stale, along with everything that transitively
+ * depends on it — editing a lemma invalidates the theorems that cite it.
+ *
+ * The graph comes from the parse the run is already holding. The `§10.6`
+ * `dependency_edges` table was designed for this, but an edge row keys both
+ * endpoints to `claim_revisions` and a run materializes a revision only for its
+ * own target, so filling it would mean persisting a revision for every claim in
+ * the document. The parser has already resolved these edges, and reading them
+ * needs no new rows at all.
+ */
+export function propagateStaleness(
+  db: Database,
+  projectId: string,
+  doc: ParsedDocument,
+  changedClaimId: string,
+): void {
+  // `edge.from` depends on `edge.to`, so dependents are found by walking back.
+  const dependents = new Map<string, string[]>();
+  for (const edge of doc.edges) {
+    const existing = dependents.get(edge.to);
+    if (existing) existing.push(edge.from);
+    else dependents.set(edge.to, [edge.from]);
+  }
+
+  // Only a claim that had been established loses something by going stale;
+  // pending and failed ones are already not verified.
+  const markStale = db.prepare(
+    `UPDATE claim_identities SET statusCache = 'stale'
+     WHERE claimIdentityId = ? AND statusCache IN ('verified','verifiedByOverride','formalized')`,
+  );
+  const findIdentity = db.prepare(
+    'SELECT claimIdentityId FROM claim_identities WHERE projectId = ? AND currentLabel = ?',
+  );
+  const claimsById = new Map(doc.claims.map((claim) => [claim.id, claim]));
+
   const visited = new Set<string>();
-  const queue = [changedIdentityId];
+  const queue = [changedClaimId];
 
   while (queue.length > 0) {
-    const id = queue.shift()!;
-    if (visited.has(id)) continue;
-    visited.add(id);
+    const claimId = queue.shift()!;
+    if (visited.has(claimId)) continue;
+    visited.add(claimId);
 
-    // Mark verified claims as stale; pending/failed stay as-is (they're already not verified).
-    db.prepare(
-      `UPDATE claim_identities SET statusCache = 'stale'
-       WHERE claimIdentityId = ? AND statusCache IN ('verified','verifiedByOverride')`,
-    ).run(id);
+    // Identities exist only for claims that have been run before; the rest have
+    // nothing cached to invalidate, but their dependents still might.
+    const identityKey = claimsById.get(claimId)?.label ?? claimId;
+    const identity = findIdentity.get(projectId, identityKey) as
+      | { claimIdentityId: string }
+      | undefined;
+    if (identity) markStale.run(identity.claimIdentityId);
 
-    // Downstream: claims whose revisions reference a revision of this identity.
-    const downstreams = db
-      .prepare(
-        `SELECT DISTINCT ci.claimIdentityId
-         FROM dependency_edges de
-         JOIN claim_revisions cr_to  ON de.toClaimRevisionId   = cr_to.claimRevisionId
-         JOIN claim_revisions cr_from ON de.fromClaimRevisionId = cr_from.claimRevisionId
-         JOIN claim_identities ci    ON cr_from.claimIdentityId = ci.claimIdentityId
-         WHERE cr_to.claimIdentityId = ? AND ci.projectId = ?`,
-      )
-      .all(id, projectId) as { claimIdentityId: string }[];
-
-    for (const d of downstreams) {
-      if (!visited.has(d.claimIdentityId)) queue.push(d.claimIdentityId);
-    }
+    queue.push(...(dependents.get(claimId) ?? []));
   }
 }
 
@@ -400,7 +487,7 @@ function upsertClaimRevision(
 
   // New revision for an existing identity — propagate staleness to verified dependents.
   if (!identityWasNew) {
-    propagateStaleness(db, projectId, identity.claimIdentityId);
+    propagateStaleness(db, projectId, doc, claimId);
   }
 
   const revisionId = randomUUID();
@@ -445,12 +532,17 @@ export interface PipelineInput {
   parsedDocumentFingerprint: string;
   parserVersion: string;
   leanProjectDir: string;
+  mode?: VerificationMode;
 }
+
+/** Per-run caps, used both to start a run and to rehydrate a paused one. */
+export const DEFAULT_TOKEN_BUDGET_CAP = 250_000;
+export const DEFAULT_WALL_CLOCK_CAP_MS = 60_000;
 
 export interface PipelineConfig {
   leanVersion: string;
   mathlibRevision: string;
-  proverConfigId: string;
+  proposerConfigId: string;
   formalizerConfigId: string;
   auxiliaryConfigId: string;
   tokenBudgetCap: number;
@@ -476,17 +568,18 @@ export async function runPipeline(
 
   db.prepare(
     `INSERT INTO audit_runs
-       (auditRunId, projectId, requestId, status, phase, startedAt,
-        leanVersion, mathlibRevision, proverConfigId, formalizerConfigId, auxiliaryConfigId)
-     VALUES (?, ?, ?, 'queued', 'parseSnapshot', ?, ?, ?, ?, ?, ?)`,
+       (auditRunId, projectId, requestId, mode, status, phase, startedAt,
+        leanVersion, mathlibRevision, proposerConfigId, formalizerConfigId, auxiliaryConfigId)
+     VALUES (?, ?, ?, ?, 'queued', 'parseSnapshot', ?, ?, ?, ?, ?, ?)`,
   ).run(
     auditRunId,
     input.projectId,
     input.requestId,
+    input.mode ?? 'full',
     startedAt,
     config.leanVersion,
     config.mathlibRevision,
-    config.proverConfigId,
+    config.proposerConfigId,
     config.formalizerConfigId,
     config.auxiliaryConfigId,
   );
@@ -567,11 +660,8 @@ async function executePipeline(
   options: ExecutePipelineOptions = {},
 ): Promise<void> {
   const emit = makeEventEmitter(db, auditRunId);
-  const budget: TokenBudget = {
-    capTokens: config.tokenBudgetCap,
-    usedInputTokens: options.initialTokenUsage?.inputTokens ?? 0,
-    usedOutputTokens: options.initialTokenUsage?.outputTokens ?? 0,
-  };
+  const budget = new RunBudget(config.tokenBudgetCap,
+    options.initialTokenUsage?.inputTokens ?? 0, options.initialTokenUsage?.outputTokens ?? 0);
 
   const finish = (outcome: VerificationOutcome, phase: RunPhase = 'complete'): void => {
     const finishedAt = new Date().toISOString();
@@ -599,14 +689,26 @@ async function executePipeline(
       finish('verificationBlocked', 'parseSnapshot');
       return;
     }
-    const targetNeedsProof = isVerifiableClaimKind(targetClaim.kind);
+    // Definitions never carry a proof; `formalizeOnly` opts a provable claim
+    // out of proof generation for this run.
+    const targetIsTheorem = isVerifiableClaimKind(targetClaim.kind);
+    const targetNeedsProof = targetIsTheorem && input.mode !== 'formalizeOnly';
+    const artifactLabel = targetIsTheorem ? 'Statement' : 'Definition';
+    if (input.mode === 'formalizeOnly' && targetIsTheorem) {
+      emit('selectContext', 'info', 'Formalize-only run: statement and faithfulness checks, no proof attempt');
+    }
+    if (doc.issues.some(issue => issue.severity === 'error')) {
+      emit('parseSnapshot', 'error', 'Resolve document parser errors before verification');
+      finish('verificationBlocked', 'parseSnapshot');
+      return;
+    }
 
     const snapshotId = upsertSnapshot(
       db,
       input.projectId,
       doc,
       input.documentText,
-      input.parserVersion,
+      PARSER_VERSION,
     );
     const claimRevisionId = upsertClaimRevision(
       db,
@@ -634,33 +736,46 @@ async function executePipeline(
 
     if (context.unresolvedDependencyLabels.length > 0) {
       emit('selectContext', 'warning', `Unresolved dependencies: ${context.unresolvedDependencyLabels.join(', ')}`);
+      finish('dependencyMissing', 'selectContext');
+      return;
     }
 
     const missingFormalizedDependencies = context.resolvedDependencies
-      .filter((dependency) => isFormalizationDependency(dependency) && !dependency.leanDeclaration)
+      .filter((dependency) => !dependency.leanDeclaration)
       .map((dependency) => dependency.label);
     if (missingFormalizedDependencies.length > 0) {
       emit(
         'selectContext',
         'warning',
-        `Referenced definitions need formalization first: ${missingFormalizedDependencies.join(', ')}`,
+        `Referenced items need current accepted formalizations first: ${missingFormalizedDependencies.join(', ')}`,
       );
       finish('dependencyMissing', 'selectContext');
       return;
     }
 
+    // ── Cost preflight ───────────────────────────────────────────────────
+    // Priced before the first request, so an underfunded account is told now
+    // rather than after three quarters of a run has been paid for.
+    if (!(await preflightCost(db, config, budget, emit))) {
+      finish('verificationBlocked', 'selectContext');
+      return;
+    }
+
     // Build all model clients once, used across all pipeline stages.
     checkBudget(budget);
-    const formalizerClient = await buildModelClient(db, config.formalizerConfigId);
-    const auxiliaryClient = await buildModelClient(db, config.auxiliaryConfigId);
-    const proverClient = await buildModelClient(db, config.proverConfigId);
+    const formalizerClient = await buildModelClient(db, config.formalizerConfigId, budget, emit, auditRunId);
+    const auxiliaryClient = await buildModelClient(db, config.auxiliaryConfigId, budget, emit, auditRunId);
+    const proposerClient = await buildModelClient(db, config.proposerConfigId, budget, emit, auditRunId);
 
     const runner = new LeanRunner({
       projectDir: input.leanProjectDir,
       wallClockCapMs: config.wallClockCapMs,
     });
 
-    const depDecls = formatDependencyDeclarations(context.resolvedDependencies);
+    // Both widen if a proof-skeleton run establishes the author's steps: from
+    // that point the steps are part of the claim's environment.
+    let proposerContext = context;
+    let depDecls = formatDependencyDeclarations(context.resolvedDependencies);
 
     // ── §3.5 Informal advisory audit ─────────────────────────────────────
     if (targetNeedsProof && !options.skipInformalAudit) {
@@ -672,17 +787,18 @@ async function executePipeline(
       let informalFindings: string[] = [];
 
       try {
-        const informalResult = await runInformalAudit(
-          auxiliaryClient,
-          context.statementText,
-          context.proofText ?? '',
-          depDecls,
+        const informalResult = await withHeartbeat(
+          () => runInformalAudit(
+            auxiliaryClient,
+            context.statementText,
+            context.proofText ?? '',
+            depDecls,
+          ),
+          heartbeatTick(emit, 'informalAudit', 'Informal advisory'),
         );
         informalVerdict = informalResult.verdict;
         informalConfidence = informalResult.confidence;
         informalFindings = informalResult.findings;
-        budget.usedInputTokens += informalResult.usage.inputTokens;
-        budget.usedOutputTokens += informalResult.usage.outputTokens;
       } catch (err) {
         emit('informalAudit', 'warning', `Informal audit failed (non-blocking): ${String(err)}`);
       }
@@ -712,8 +828,8 @@ async function executePipeline(
           policy: informalPolicy,
           paused: shouldPause,
           tokenUsage: {
-            inputTokens: budget.usedInputTokens,
-            outputTokens: budget.usedOutputTokens,
+            inputTokens: budget.inputTokens,
+            outputTokens: budget.outputTokens,
           },
         };
 
@@ -735,7 +851,7 @@ async function executePipeline(
     }
 
     // ── §3.7 Formalize statement ─────────────────────────────────────────
-    emit('formalizeStatement', 'info', targetNeedsProof ? 'Formalizing statement' : 'Formalizing definition');
+    emit('formalizeStatement', 'info', targetIsTheorem ? 'Formalizing statement' : 'Formalizing definition');
     updateRunStatus(db, auditRunId, 'running', 'formalizeStatement');
     checkBudget(budget);
 
@@ -744,7 +860,7 @@ async function executePipeline(
       emit(
         'formalizeStatement',
         attempt.status === 'ok' ? 'info' : 'warning',
-        `${targetNeedsProof ? 'Statement' : 'Definition'} formalization attempt ${attempt.attemptIndex + 1}: ${attempt.status}`,
+        `${artifactLabel} formalization attempt ${attempt.attemptIndex + 1}: ${attempt.status}`,
         {
           attemptIndex: attempt.attemptIndex,
           status: attempt.status,
@@ -783,7 +899,7 @@ async function executePipeline(
         : undefined,
     );
 
-    const formalized = targetNeedsProof
+    const formalized = targetIsTheorem
       ? await formalizeAndCheck(
           formalizerClient,
           runner,
@@ -802,8 +918,6 @@ async function executePipeline(
         );
 
     if (!formalized.ok) {
-      budget.usedInputTokens += formalized.totalUsage.inputTokens;
-      budget.usedOutputTokens += formalized.totalUsage.outputTokens;
 
       if (formalized.attempts.length === 0) {
         db.prepare(
@@ -829,8 +943,6 @@ async function executePipeline(
       return;
     }
 
-    budget.usedInputTokens += formalized.totalUsage.inputTokens;
-    budget.usedOutputTokens += formalized.totalUsage.outputTokens;
 
     // Persist statement attempt + frozen header.
     for (const attempt of formalized.attempts) {
@@ -856,6 +968,7 @@ async function executePipeline(
       formalized.theoremName,
       formalized.sourceHash,
       JSON.stringify({
+        normalizedGoalTerm: formalized.normalizedGoalTerm,
         artifactKind: formalized.artifactKind,
         leanSource: formalized.leanSource,
         termMap: formalized.termMap,
@@ -865,7 +978,7 @@ async function executePipeline(
     emit(
       'formalizeStatement',
       'info',
-      `${targetNeedsProof ? 'Statement' : 'Definition'} formalized: ${formalized.theoremName}`,
+      `${artifactLabel} formalized: ${formalized.theoremName}`,
     );
 
     // ── §3.8 Faithfulness check ──────────────────────────────────────────
@@ -873,31 +986,33 @@ async function executePipeline(
     updateRunStatus(db, auditRunId, 'running', 'faithfulness');
     checkBudget(budget);
 
-    const faithfulness = targetNeedsProof
-      ? await checkFaithfulness(
+    const faithfulness = await withHeartbeat(
+      () => targetIsTheorem
+      ? checkFaithfulness(
           auxiliaryClient,
           formalizerClient,
-          proverClient,
+          proposerClient,
           runner,
           formalized,
           context.statementText,
+          context.ambientContext,
           context.resolvedDependencies,
           config.leanVersion,
           config.mathlibRevision,
         )
-      : await checkDefinitionFaithfulness(
+      : checkDefinitionFaithfulness(
           auxiliaryClient,
           formalizerClient,
           runner,
           formalized,
           context.statementText,
+          context.ambientContext,
           context.resolvedDependencies,
           config.leanVersion,
           config.mathlibRevision,
-        );
-
-    budget.usedInputTokens += faithfulness.totalUsage.inputTokens;
-    budget.usedOutputTokens += faithfulness.totalUsage.outputTokens;
+        ),
+      heartbeatTick(emit, 'faithfulness', 'Faithfulness checks'),
+    );
 
     // Persist faithfulness checks.
     db.prepare(
@@ -930,48 +1045,173 @@ async function executePipeline(
     );
 
     if (faithfulness.verdict === 'unfaithful') {
-      finish(targetNeedsProof ? 'proofDoesNotSupportClaim' : 'formalizationUnfaithful', 'faithfulness');
-      return;
-    }
-
-    if (!targetNeedsProof && faithfulness.verdict !== 'faithful') {
       emit(
         'faithfulness',
         'warning',
-        `Definition formalization needs human review: ${faithfulness.roundtripEvidence ?? faithfulness.verdict}`,
+        `Formalization rejected as unfaithful: ${faithfulness.roundtripEvidence ?? 'no explanation recorded'}`,
+        { backtranslatedNL: faithfulness.backtranslatedNL },
+      );
+      // What failed here is the formalization, not a proof — no proof has been
+      // attempted at this point, and for a `formalizeOnly` run none ever will.
+      // `proofDoesNotSupportClaim` named the wrong artifact and contradicted the
+      // outcome table in docs/tester-quickstart.md.
+      finish('formalizationUnfaithful', 'faithfulness');
+      return;
+    }
+
+    // The final gate accepts only `faithful` and `likelyFaithful`, so any other
+    // verdict has already decided the run — proving cannot rescue it. Stop here
+    // rather than paying for a proof that could never be accepted.
+    if (!ACCEPTABLE_FAITHFULNESS.has(faithfulness.verdict)) {
+      const reason = faithfulness.roundtripEvidence ?? faithfulness.verdict;
+      emit(
+        'faithfulness',
+        'warning',
+        targetNeedsProof
+          ? `Faithfulness verdict ${faithfulness.verdict} cannot pass the final gate, so no proof is attempted: ${reason}`
+          : `${artifactLabel} formalization needs human review: ${reason}`,
+        { verdict: faithfulness.verdict },
       );
       finish('verificationBlocked', 'faithfulness');
       return;
     }
 
-    emit('faithfulness', 'info', `Faithfulness verdict: ${faithfulness.verdict}`);
+    emit(
+      'faithfulness',
+      'info',
+      `Faithfulness verdict: ${faithfulness.verdict} (roundtrip: `
+      + `${faithfulness.roundtripTier ? `closed at tier ${faithfulness.roundtripTier}` : 'not established'})`,
+      { verdict: faithfulness.verdict, roundtripTier: faithfulness.roundtripTier },
+    );
 
     // ── §3.9 Header is now frozen (already recorded above) ───────────────
     emit('freezeHeader', 'info', `Header frozen: ${formalized.theoremName}`);
 
+    // ── Proof skeleton: check the author's argument, not just the theorem ──
+    if (targetNeedsProof && input.mode === 'proofSkeleton') {
+      emit('proofSteps', 'info', "Formalizing the author's proof, step by step");
+      updateRunStatus(db, auditRunId, 'running', 'proofSteps');
+
+      const skeleton = await withHeartbeat(
+        () => checkProofSkeleton(
+          auxiliaryClient,
+          formalizerClient,
+          proposerClient,
+          runner,
+          formalized.leanSource,
+          context,
+          config.leanVersion,
+          config.mathlibRevision,
+          {
+            onProgress: (message: string, payload?: Record<string, unknown>) =>
+              emit('proofSteps', 'info', message, payload),
+            // The frozen statement's imports are already known to exist and to
+            // be compiled, and every step has to elaborate in that same
+            // environment. Step formalization was the one path getting no
+            // import hints at all.
+            mathlibImportHints: extractLeanImports(formalized.leanSource),
+          },
+        ),
+        heartbeatTick(emit, 'proofSteps', 'Proof steps'),
+      );
+
+      for (const step of skeleton.steps) {
+        db.prepare(
+          `INSERT INTO proof_steps (proofStepId, auditRunId, idx, sourceText, status, artifactsJson)
+           VALUES (?, ?, ?, ?, ?, ?)`,
+        ).run(
+          randomUUID(),
+          auditRunId,
+          step.idx,
+          step.sourceText || step.claim,
+          step.status,
+          JSON.stringify({
+            claim: step.claim,
+            uses: step.uses,
+            leanSource: step.leanSource,
+            theoremName: step.theoremName,
+            diagnostics: step.diagnostics,
+            proof: step.proof,
+          }),
+        );
+
+        const ok = step.status === 'checked' && step.proof.status === 'proved';
+        emit(
+          'proofSteps',
+          ok ? 'info' : 'warning',
+          ok
+            ? `Step ${step.idx} proved (${step.proof.closedBy}): ${step.claim}`
+            : step.status !== 'checked'
+              ? `Step ${step.idx} could not be stated in Lean (${step.status}): ${step.claim} — ${step.diagnostics.join('; ').slice(0, 400)}`
+              : `Step ${step.idx} stated but not proved: ${step.claim} — ${step.proof.diagnostics.join('; ').slice(0, 400)}`,
+          { idx: step.idx, status: step.status, proof: step.proof.status, closedBy: step.proof.closedBy },
+        );
+      }
+
+      const unstated = skeleton.steps.filter((step) => step.status !== 'checked');
+      const unproved = skeleton.steps.filter((step) => step.proof.status !== 'proved');
+      emit(
+        'proofSteps',
+        'info',
+        `Proof skeleton: ${skeleton.steps.length - unstated.length}/${skeleton.steps.length} steps stated, `
+        + `${skeleton.steps.length - unproved.length}/${skeleton.steps.length} proved`,
+      );
+
+      if (skeleton.steps.length === 0 || unstated.length > 0 || unproved.length > 0) {
+        emit(
+          'finalGate',
+          'info',
+          `Budget used: ${budget.inputTokens + budget.outputTokens} / ${budget.cap} tokens${formatSpend(budget)}`,
+        );
+        // The argument did not survive in full, so the claim is not established
+        // by it — whatever the theorem's truth may be.
+        finish('proofIncomplete');
+        return;
+      }
+
+      // Every step of the author's argument holds. What remains is whether they
+      // compose to the theorem, which the ordinary proposer stage now answers with
+      // the steps in scope as lemmas.
+      const stepDependencies: ResolvedDependency[] = skeleton.provedSources.map((leanSource, index) => ({
+        fingerprint: sha256(leanSource),
+        label: `proof-step-${index + 1}`,
+        kind: 'proof',
+        statementText: skeleton.steps[index]?.claim ?? '',
+        leanDeclaration: leanSource,
+        verified: true,
+      }));
+      proposerContext = {
+        ...context,
+        resolvedDependencies: [...context.resolvedDependencies, ...stepDependencies],
+      };
+      depDecls = formatDependencyDeclarations(proposerContext.resolvedDependencies);
+      emit('proofSteps', 'info', 'Every step holds — attempting to compose them into the claim');
+    }
+
     if (!targetNeedsProof) {
-      emit('finalGate', 'info', `Budget used: ${budget.usedInputTokens + budget.usedOutputTokens} / ${budget.capTokens} tokens`);
+      emit('finalGate', 'info', `Budget used: ${budget.inputTokens + budget.outputTokens} / ${budget.cap} tokens${formatSpend(budget)}`);
       finish('formalized');
       return;
     }
 
-    // ── §3.10-3.11 Prover end-to-end (cache-first) ───────────────────────
-    emit('proverAttempt', 'info', 'Running prover');
-    updateRunStatus(db, auditRunId, 'running', 'proverAttempt');
+    // ── §3.10-3.11 Proposer end-to-end (cache-first) ─────────────────────
+    emit('proposerAttempt', 'info', 'Proposing a proof');
+    updateRunStatus(db, auditRunId, 'running', 'proposerAttempt');
     checkBudget(budget);
 
     // Check cache before invoking the model (§7). Only a positive hit skips the
-    // prover — cached failures must NOT short-circuit the intra-run retry loop.
+    // proposer — cached failures must NOT short-circuit the intra-run retry loop.
     const cacheInstance = new LeanCheckCache(db);
-    const cacheKeyObj = buildCacheKey(context, formalized, config);
+    const cacheKeyObj = buildCacheKey(proposerContext, formalized, config);
     const cacheHit = cacheInstance.lookup(cacheKeyObj);
 
-    let proverResult: ProverResult;
+    let proposerResult: ProposerResult;
 
-    if (cacheHit?.status === 'ok' && cacheHit.provenByJson) {
-      const cachedSource = JSON.parse(cacheHit.provenByJson) as string;
-      emit('proverAttempt', 'info', 'Cache hit — skipping prover', { cacheKey: cacheHit.cacheKey });
-      proverResult = {
+    const cachedSource = cacheHit?.status === 'ok'
+      ? await validateCachedProof(cacheHit.provenByJson, formalized, depDecls, runner) : null;
+    if (cachedSource) {
+      emit('proposerAttempt', 'info', 'Cached proof passed fresh kernel validation — skipping model', { cacheKey: cacheHit?.cacheKey });
+      proposerResult = {
         outcome: 'verified',
         acceptedLeanSource: cachedSource,
         attempts: [],
@@ -979,15 +1219,25 @@ async function executePipeline(
       };
     } else {
       if (cacheHit) {
-        emit('proverAttempt', 'info', `Cache entry found (status: ${cacheHit.status}) — proceeding with fresh attempt`);
+        emit('proposerAttempt', 'info', `Cache entry found (status: ${cacheHit.status}) — proceeding with fresh attempt`);
       }
-      proverResult = await runProver(proverClient, runner, formalized, context);
-      budget.usedInputTokens += proverResult.totalUsage.inputTokens;
-      budget.usedOutputTokens += proverResult.totalUsage.outputTokens;
+      proposerResult = await withHeartbeat(
+        () => runProposer(proposerClient, runner, formalized, proposerContext),
+        heartbeatTick(emit, 'proposerAttempt', 'Proposing a proof'),
+      );
     }
 
-    // Persist proof attempts.
-    for (const attempt of proverResult.attempts) {
+    // Persist proof attempts, and say why each one failed — a run that stops
+    // here otherwise shows nothing between "Proposing a proof" and "blocked".
+    for (const attempt of proposerResult.attempts) {
+      if (attempt.status !== 'ok' && attempt.diagnostics.length > 0) {
+        emit(
+          'proposerAttempt',
+          'warning',
+          `Proof attempt ${attempt.attemptIndex + 1} ${attempt.status}: ${attempt.diagnostics.join('; ').slice(0, 600)}`,
+          { attemptIndex: attempt.attemptIndex, status: attempt.status, failureClass: attempt.failureClass },
+        );
+      }
       db.prepare(
         `INSERT INTO statement_attempts (statementAttemptId, auditRunId, attemptIndex, status, artifactsJson)
          VALUES (?, ?, ?, ?, ?)`,
@@ -1008,10 +1258,18 @@ async function executePipeline(
     emit('finalGate', 'info', 'Running final gate checks');
     updateRunStatus(db, auditRunId, 'running', 'finalGate');
 
-    const gate = runFinalGate(formalized, faithfulness, proverResult);
+    // Cache entries are hints, never authorities: always recheck the exact goal.
+    if (proposerResult.acceptedLeanSource) {
+      const recheck = await runner.check(composeLeanFile(depDecls, proposerResult.acceptedLeanSource), { declarationName: formalized.theoremName });
+      if (recheck.status !== 'ok' || recheck.certificate?.normalizedGoalTerm !== formalized.normalizedGoalTerm) {
+        emit('finalGate', 'error', 'Final kernel recheck failed', { diagnostics: recheck.diagnostics });
+        proposerResult = { ...proposerResult, outcome: 'verificationBlocked', acceptedLeanSource: null };
+      }
+    }
+    const gate = runFinalGate(formalized, faithfulness, proposerResult);
 
     // Persist final proof artifact.
-    if (proverResult.acceptedLeanSource) {
+    if (proposerResult.acceptedLeanSource) {
       const cacheKey = deriveCacheKey(cacheKeyObj);
       db.prepare(
         `INSERT INTO final_proof_artifacts
@@ -1021,8 +1279,8 @@ async function executePipeline(
       ).run(
         randomUUID(),
         auditRunId,
-        proverResult.acceptedLeanSource,
-        sha256(proverResult.acceptedLeanSource),
+        proposerResult.acceptedLeanSource,
+        sha256(proposerResult.acceptedLeanSource),
         cacheKey,
         JSON.stringify(gate.violations),
         JSON.stringify([]),
@@ -1033,7 +1291,7 @@ async function executePipeline(
       // Store in Lean check cache.
       cacheInstance.store(cacheKeyObj, {
         status: gate.passed ? 'ok' : 'failed',
-        provenByJson: gate.passed ? JSON.stringify(proverResult.acceptedLeanSource) : null,
+        provenByJson: gate.passed ? JSON.stringify(proposerResult.acceptedLeanSource) : null,
         diagnosticsJson: JSON.stringify(gate.violations),
         elapsedMs: 0,
       });
@@ -1043,7 +1301,7 @@ async function executePipeline(
       emit('finalGate', 'warning', `Gate violations: ${gate.violations.join('; ')}`);
     }
 
-    emit('finalGate', 'info', `Budget used: ${budget.usedInputTokens + budget.usedOutputTokens} / ${budget.capTokens} tokens`);
+    emit('finalGate', 'info', `Budget used: ${budget.inputTokens + budget.outputTokens} / ${budget.cap} tokens${formatSpend(budget)}`);
 
     finish(gate.outcome);
   } catch (err) {
@@ -1068,8 +1326,7 @@ interface RehydratedPipelineRun {
   startedAt: string;
 }
 
-const DEFAULT_TOKEN_BUDGET_CAP = 100_000;
-const DEFAULT_WALL_CLOCK_CAP_MS = 60_000;
+
 
 async function resumePipelineAfterInformalAcknowledgement(
   db: Database,
@@ -1103,6 +1360,10 @@ async function resumePipelineAfterInformalAcknowledgement(
 
     emit('complete', 'error', `Pipeline resume error: ${message}`, { error: message });
     updateRunStatus(db, auditRunId, 'finished', 'complete', outcome, finishedAt, durationMs);
+    // `finish()` always pairs the run update with the claim's cached status;
+    // this path has to as well, or the claim stays `checking` forever while its
+    // run reads `verificationBlocked`.
+    updateClaimStatusCacheForOutcome(db, auditRunId, outcome);
     emitSse(auditRunId, 'complete', { auditRunId, outcome });
   }
 }
@@ -1122,7 +1383,7 @@ function rehydratePipelineRun(
   if (!run.leanVersion || !run.mathlibRevision) {
     throw new Error(`Run is missing Lean or Mathlib pin: ${auditRunId}`);
   }
-  if (!run.proverConfigId || !run.formalizerConfigId || !run.auxiliaryConfigId) {
+  if (!run.proposerConfigId || !run.formalizerConfigId || !run.auxiliaryConfigId) {
     throw new Error(`Run is missing provider configuration: ${auditRunId}`);
   }
 
@@ -1185,11 +1446,12 @@ function rehydratePipelineRun(
       parsedDocumentFingerprint: snapshot.documentFingerprint,
       parserVersion: snapshot.parserVersion,
       leanProjectDir,
+      mode: run.mode,
     },
     config: {
       leanVersion: run.leanVersion,
       mathlibRevision: run.mathlibRevision,
-      proverConfigId: run.proverConfigId,
+      proposerConfigId: run.proposerConfigId,
       formalizerConfigId: run.formalizerConfigId,
       auxiliaryConfigId: run.auxiliaryConfigId,
       tokenBudgetCap: runtimeSettings.tokenBudgetCap,
@@ -1283,8 +1545,7 @@ function hydrateDependencyDeclarations(
   return {
     ...context,
     resolvedDependencies: context.resolvedDependencies.map((dependency) => {
-      if (!isFormalizationDependency(dependency)) return dependency;
-      const leanDeclaration = latestAcceptedLeanDeclaration(db, projectId, dependency.label);
+      const leanDeclaration = latestAcceptedLeanDeclaration(db, projectId, dependency.label, dependency.fingerprint);
       return leanDeclaration
         ? { ...dependency, leanDeclaration, verified: true }
         : dependency;
@@ -1296,28 +1557,35 @@ function latestAcceptedLeanDeclaration(
   db: Database,
   projectId: string,
   label: string,
+  fingerprint: string,
 ): string | null {
   const row = db
     .prepare(
-      `SELECT fh.artifactsJson
+      `SELECT fh.artifactsJson, fpa.leanSource AS provenSource
        FROM frozen_headers fh
        JOIN audit_runs ar ON ar.auditRunId = fh.auditRunId
+       LEFT JOIN final_proof_artifacts fpa ON fpa.auditRunId = ar.auditRunId AND fpa.acceptedByLean = 1
        JOIN claim_revisions cr ON cr.claimRevisionId = ar.targetClaimRevisionId
        JOIN claim_identities ci ON ci.claimIdentityId = cr.claimIdentityId
        WHERE ci.projectId = ?
          AND cr.label = ?
+         AND cr.claimFingerprint = ?
+         AND ci.statusCache IN ('verified', 'formalized')
          AND ar.status = 'finished'
          AND ar.outcome IN ('verified', 'formalized')
        ORDER BY ar.finishedAt DESC
        LIMIT 1`,
     )
-    .get(projectId, label) as { artifactsJson: string } | undefined;
+    .get(projectId, label, fingerprint) as { artifactsJson: string; provenSource: string | null } | undefined;
 
   if (!row) return null;
 
+  if (row.provenSource) return row.provenSource;
   try {
-    const artifacts = JSON.parse(row.artifactsJson) as { leanSource?: unknown };
-    return typeof artifacts.leanSource === 'string' && artifacts.leanSource.trim()
+    const artifacts = JSON.parse(row.artifactsJson) as { artifactKind?: unknown; leanSource?: unknown };
+    // A formalized theorem still contains sorry. Only accepted definitions can
+    // be reused without a kernel-accepted proof artifact.
+    return artifacts.artifactKind === 'definition' && typeof artifacts.leanSource === 'string' && artifacts.leanSource.trim()
       ? artifacts.leanSource
       : null;
   } catch {
@@ -1325,17 +1593,9 @@ function latestAcceptedLeanDeclaration(
   }
 }
 
-function isFormalizationDependency(dependency: ResolvedDependency): boolean {
-  return (
-    dependency.kind === 'definition' ||
-    dependency.kind === 'axiom' ||
-    dependency.kind === 'postulate'
-  );
-}
-
 function buildCacheKey(
   context: ReturnType<typeof selectReachableContext>,
-  formalized: { theoremName: string; leanSource: string },
+  formalized: { theoremName: string; leanSource: string; normalizedGoalTerm: string },
   config: PipelineConfig,
 ): CacheKey {
   const envFingerprint = buildEnvironmentFingerprint(
@@ -1344,13 +1604,26 @@ function buildCacheKey(
     config.mathlibRevision,
   );
   return {
-    normalizedGoalTerm: formalized.leanSource,
-    environmentFingerprint: envFingerprint,
+    normalizedGoalTerm: formalized.normalizedGoalTerm,
+    environmentFingerprint: JSON.stringify({
+      policy: 'astra-kernel-v1',
+      context: envFingerprint,
+      preamble: leanPreamble(formalized.leanSource),
+    }),
     leanVersion: config.leanVersion,
     mathlibRevision: config.mathlibRevision,
   };
 }
 
-function sha256(s: string): string {
-  return createHash('sha256').update(s).digest('hex');
+/**
+ * Everything before the declaration — the imports and `open` commands the goal
+ * is elaborated under, which are part of what the cached result is true of.
+ *
+ * A bare `indexOf` returning -1 here used to make `slice(0, -1)` the whole
+ * source minus its last character, so a source without the needle produced a
+ * plausible-looking key over the wrong text instead of failing.
+ */
+function leanPreamble(leanSource: string): string {
+  const declaration = /^[ \t]*(?:theorem|lemma|def|abbrev|structure|class)\b/m.exec(leanSource);
+  return declaration ? leanSource.slice(0, declaration.index) : leanSource;
 }

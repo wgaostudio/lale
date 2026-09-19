@@ -1,25 +1,29 @@
 import {
+  readSse,
+  RunResult,
   AcceptedRunResponse,
   CreateProjectRequest,
   HealthResponse,
   InformalAuditVerdict,
   ProjectLookupRequest,
   ProjectLookupResponse,
+  ProviderConfigsResponse,
   ProvisionEvent,
   ProvisionStateResponse,
   RunEvent,
+  VerificationMode,
   VerificationRequest,
+  VerificationOutcome,
+  type ExtensionClaimStatus,
 } from '@lale/protocol';
 import { PARSER_VERSION } from '@lale/document-parser';
 import type { ParsedClaim } from '@lale/document-parser';
 import type {
-  AuxiliaryConfigInfo,
   BackgroundBroadcastMessage,
   BackgroundToContentMessage,
   ClaimRuntimeState,
   ContentToBackgroundMessage,
   ExtensionState,
-  FormalizerOption,
   InformalAuditState,
   SidepanelToBackgroundMessage,
 } from '../shared/messages';
@@ -65,8 +69,10 @@ let state: ExtensionState = {
   latestRunEvents: [],
   latestAcceptedRun: null,
   informalAudit: null,
-  formalizerOptions: null,
+  formalizerConfig: null,
+  proposerConfig: null,
   auxiliaryConfig: null,
+  hasOpenRouterKey: false,
   provision: null,
   provisionEvents: [],
   error: null,
@@ -77,10 +83,10 @@ chrome.runtime.onInstalled.addListener(() => {
   void chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true });
 });
 
-void restoreState();
+const restoredState = restoreState();
 
 chrome.runtime.onMessage.addListener((message: unknown, sender, sendResponse) => {
-  void handleMessage(message, sender.tab?.id ?? null)
+  void restoredState.then(() => handleMessage(message, sender.tab?.id ?? null))
     .then((response) => sendResponse({ ok: true, response }))
     .catch((error: unknown) =>
       sendResponse({ ok: false, error: error instanceof Error ? error.message : String(error) }),
@@ -141,13 +147,16 @@ async function handleSidepanelMessage(
       await createProject();
       return state;
     case 'sidepanel.verifyClaim':
-      await verifyClaim(message.claimId);
+      await verifyClaim(message.claimId, message.mode ?? 'full');
       return state;
     case 'sidepanel.jumpToSource':
       await jumpToSource(message.claimId, tabId);
       return state;
     case 'sidepanel.acknowledgeInformalAudit':
       await acknowledgeInformalAudit(message.runId, message.reason);
+      return state;
+    case 'sidepanel.requestPairing':
+      await requestPairing();
       return state;
     case 'sidepanel.setBearerToken':
       await applyBearerToken(message.token);
@@ -158,14 +167,11 @@ async function handleSidepanelMessage(
     case 'sidepanel.startProvision':
       await startProvisionRun(message.force ?? false);
       return state;
-    case 'sidepanel.switchFormalizer':
-      await switchFormalizer(message.configId, message.optionKey);
+    case 'sidepanel.setOpenRouterKey':
+      await setOpenRouterKey(message.key);
       return state;
-    case 'sidepanel.setNamedKey':
-      await setNamedProviderKey(message.provider, message.key);
-      return state;
-    case 'sidepanel.clearNamedKey':
-      await clearNamedProviderKey(message.provider);
+    case 'sidepanel.clearOpenRouterKey':
+      await clearOpenRouterKey();
       return state;
   }
 }
@@ -195,6 +201,9 @@ async function refreshDesktopState(): Promise<void> {
     if (state.desktopAuthStatus !== 'unauthorized') {
       await refreshProjectLookup();
       await refreshProviderConfigs(token);
+      for (const claim of state.claimStates) {
+        if (claim.status === 'checking' && claim.runId) subscribeToRunEvents(claim.runId, claim.claimId, token);
+      }
     }
   } catch (error) {
     await setState({
@@ -297,7 +306,7 @@ async function createProject(): Promise<void> {
   });
 }
 
-async function verifyClaim(claimId: string): Promise<void> {
+async function verifyClaim(claimId: string, mode: VerificationMode = 'full'): Promise<void> {
   if (!state.snapshot || !state.parsedDocument) {
     throw new Error('No document snapshot available.');
   }
@@ -328,6 +337,7 @@ async function verifyClaim(claimId: string): Promise<void> {
     snapshot: state.snapshot,
     parsedDocumentFingerprint: state.parsedDocument.fingerprint,
     parserVersion: PARSER_VERSION,
+    mode,
   };
 
   const response = await fetch(`${DESKTOP_URL}/v1/verify`, {
@@ -358,141 +368,87 @@ async function verifyClaim(claimId: string): Promise<void> {
   subscribeToRunEvents(accepted.runId, claimId, token);
 }
 
+const runStreams = new Set<string>();
+// A Chrome MV3 service worker is torn down after ~30s idle, which kills the
+// run stream with it: the panel then freezes until something wakes the worker.
+// The desktop now heartbeats every 15s, and this alarm covers the gaps where it
+// cannot — a long Lean check, or a dropped connection with nothing arriving.
+const RUN_KEEPALIVE_ALARM = 'lale.runKeepalive';
+
+function updateRunKeepalive(): void {
+  if (runStreams.size > 0) {
+    chrome.alarms.create(RUN_KEEPALIVE_ALARM, { periodInMinutes: 0.5 });
+  } else {
+    void chrome.alarms.clear(RUN_KEEPALIVE_ALARM).catch(() => undefined);
+  }
+}
+
+chrome.alarms.onAlarm.addListener((alarm) => {
+  // Waking is the entire point; re-attach any stream lost to a teardown.
+  if (alarm.name !== RUN_KEEPALIVE_ALARM) return;
+  void (async () => {
+    const token = await getBearerToken();
+    for (const claim of state.claimStates) {
+      if (claim.status === 'checking' && claim.runId) subscribeToRunEvents(claim.runId, claim.claimId, token);
+    }
+    updateRunKeepalive();
+  })();
+});
+
 function subscribeToRunEvents(runId: string, claimId: string, token: string | null): void {
-  const url = `${DESKTOP_URL}/v1/runs/${runId}/events`;
-
-  // EventSource doesn't support custom headers; we append token as a query param.
-  // The server should also accept it there as a fallback.
-  const urlWithToken = token ? `${url}?token=${encodeURIComponent(token)}` : url;
-
-  // Fallback: use fetch-based SSE since EventSource can't set headers.
+  if (runStreams.has(runId)) return;
+  runStreams.add(runId);
+  updateRunKeepalive();
+  const capturedFingerprint = state.parsedDocument?.claims.find(c => c.id === claimId)?.fingerprint;
+  const complete = async (outcome: string | undefined): Promise<void> => {
+    await setState({
+      ...(state.activeRunId === runId ? { activeRunId: null } : {}),
+      claimStates: updateClaimRuntime(state.claimStates, claimId, {
+        status: capturedFingerprint !== state.parsedDocument?.claims.find(c => c.id === claimId)?.fingerprint ? 'stale' : outcomeToClaimStatus(outcome), runId, phase: 'complete',
+        lastMessage: `Run finished: ${outcome ?? 'cancelled'}`, outcome: parseOutcome(outcome), updatedAt: new Date().toISOString(),
+      }),
+    });
+  };
   void (async () => {
     try {
-      const sseResponse = await fetch(urlWithToken, {
-        headers: token ? { authorization: `Bearer ${token}` } : {},
-      });
-
-      if (!sseResponse.ok || !sseResponse.body) {
-        console.error('[lale] run stream request failed', {
-          runId,
-          claimId,
-          status: sseResponse.status,
-        });
-        await setState({
-          claimStates: updateClaimRuntime(state.claimStates, claimId, {
-            status: 'failed',
-            runId,
-            phase: null,
-            lastMessage: `Run stream returned HTTP ${sseResponse.status}`,
-            outcome: null,
-            updatedAt: new Date().toISOString(),
-          }),
-        });
-        return;
-      }
-
-      const reader = sseResponse.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-        const lines = buffer.split('\n\n');
-        buffer = lines.pop() ?? '';
-
-        for (const chunk of lines) {
-          const dataLine = chunk.split('\n').find((l) => l.startsWith('data:'));
-          const eventLine = chunk.split('\n').find((l) => l.startsWith('event:'));
-
-          if (!dataLine) continue;
-          const data = JSON.parse(dataLine.slice(5).trim()) as Record<string, unknown>;
-          const eventName = eventLine?.slice(6).trim() ?? 'run_event';
-
-          if (eventName === 'run_event') {
-            const event = RunEvent.safeParse(data);
-            if (event.success) {
-              console.debug('[lale] run event', {
-                runId,
-                claimId,
-                phase: event.data.phase,
-                level: event.data.level,
-                message: event.data.message,
-                payload: event.data.payload,
-              });
-              const nextEvents = [...state.latestRunEvents, event.data];
-              if (nextEvents.length > MAX_RUN_EVENTS) {
-                nextEvents.splice(0, nextEvents.length - MAX_RUN_EVENTS);
-              }
-              const patch: Partial<ExtensionState> = {
-                latestRunEvents: nextEvents,
-                claimStates: updateClaimRuntime(state.claimStates, claimId, {
-                  status: 'checking',
-                  runId,
-                  phase: event.data.phase,
-                  lastMessage: event.data.message,
-                  outcome: null,
-                  updatedAt: event.data.timestamp,
-                }),
-              };
-              if (event.data.phase === 'informalAudit') {
-                patch.informalAudit = updateInformalAudit(
-                  state.informalAudit,
-                  runId,
-                  claimId,
-                  event.data,
-                );
-              }
-              await setState(patch);
-            }
-          } else if (eventName === 'complete') {
-            const outcome = data['outcome'] as string | undefined;
-            const claimStatus = outcomeToClaimStatus(outcome);
-            console.info('[lale] run complete', { runId, claimId, outcome, claimStatus });
-            await setState({
-              activeRunId: null,
+      for (let retry = 0; retry < 5; retry++) {
+        try {
+          // Fetch supports auth headers. Never put bearer secrets into URLs.
+          const response = await fetch(`${DESKTOP_URL}/v1/runs/${runId}/events`, { headers: authHeaders(token) });
+          if (!response.ok || !response.body) throw new Error(`Run stream returned HTTP ${response.status}`);
+          for await (const frame of readSse(response.body)) {
+            if (state.claimStates.find(c => c.claimId === claimId)?.runId !== runId) return;
+            const data = JSON.parse(frame.data) as Record<string, unknown>;
+            if (frame.event === 'complete') { await complete(typeof data.outcome === 'string' ? data.outcome : undefined); return; }
+            if (frame.event === 'error') throw new Error(String(data.error ?? 'Run stream error'));
+            if (frame.event !== 'run_event') continue;
+            const parsed = RunEvent.safeParse(data);
+            if (!parsed.success || state.latestRunEvents.some(e => e.eventId === parsed.data.eventId)) continue;
+            const event = parsed.data;
+            const patch: Partial<ExtensionState> = {
+              latestRunEvents: [...state.latestRunEvents, event].slice(-MAX_RUN_EVENTS),
               claimStates: updateClaimRuntime(state.claimStates, claimId, {
-                status: claimStatus,
-                runId,
-                phase: 'complete',
-                lastMessage: outcome ? `Run finished: ${outcome}` : 'Run finished',
-                outcome: parseOutcome(outcome),
-                updatedAt: new Date().toISOString(),
+                status: 'checking', runId, phase: event.phase, lastMessage: event.message,
+                outcome: null, updatedAt: event.timestamp,
               }),
-            });
-            return;
-          } else if (eventName === 'error') {
-            console.error('[lale] run stream error', { runId, claimId, data });
-            await setState({
-              activeRunId: null,
-              claimStates: updateClaimRuntime(state.claimStates, claimId, {
-                status: 'failed',
-                runId,
-                phase: null,
-                lastMessage: 'Run stream error',
-                outcome: null,
-                updatedAt: new Date().toISOString(),
-              }),
-            });
-            return;
+            };
+            if (event.phase === 'informalAudit') patch.informalAudit = updateInformalAudit(state.informalAudit, runId, claimId, event);
+            await setState(patch);
+          }
+        } catch { /* Read durable run state before deciding whether to reconnect. */ }
+        const response = await fetch(`${DESKTOP_URL}/v1/runs/${runId}`, { headers: authHeaders(token) }).catch(() => null);
+        if (response?.ok) {
+          const result = RunResult.safeParse(await response.json());
+          if (result.success && ['finished', 'cancelled'].includes(result.data.status)) {
+            await complete(result.data.outcome ?? undefined); return;
           }
         }
+        if (retry < 4) await new Promise(resolve => setTimeout(resolve, Math.min(1000 * 2 ** retry, 8000)));
       }
+      await setState({ error: 'Run stream disconnected. The desktop run continues; refresh to reconnect.' });
     } catch (error) {
-      console.error('[lale] failed to consume run stream', { runId, claimId, error });
-      await setState({
-        claimStates: updateClaimRuntime(state.claimStates, claimId, {
-          status: 'failed',
-          runId,
-          phase: null,
-          lastMessage: error instanceof Error ? error.message : String(error),
-          outcome: null,
-          updatedAt: new Date().toISOString(),
-        }),
-      });
-    }
+      await setState({ error: `Unable to read run status: ${String(error)}` });
+    } finally { runStreams.delete(runId); updateRunKeepalive(); }
   })();
 }
 
@@ -504,25 +460,9 @@ function outcomeToClaimStatus(outcome: string | undefined): ExtensionClaimStatus
   return 'failed';
 }
 
-type ExtensionClaimStatus = 'pending' | 'formalized' | 'verified' | 'verifiedByOverride' | 'stale' | 'blocked' | 'failed' | 'timedOut' | 'checking';
-
 function parseOutcome(outcome: string | undefined): ClaimRuntimeState['outcome'] {
-  switch (outcome) {
-    case 'formalized':
-    case 'verified':
-    case 'malformedClaim':
-    case 'malformedProof':
-    case 'claimContradicted':
-    case 'proofContradicted':
-    case 'proofIncomplete':
-    case 'proofDoesNotSupportClaim':
-    case 'formalizationUnfaithful':
-    case 'dependencyMissing':
-    case 'verificationBlocked':
-      return outcome;
-    default:
-      return null;
-  }
+  const parsed = VerificationOutcome.safeParse(outcome);
+  return parsed.success ? parsed.data : null;
 }
 
 async function jumpToSource(claimId: string, senderTabId: number | null): Promise<void> {
@@ -541,7 +481,26 @@ async function jumpToSource(claimId: string, senderTabId: number | null): Promis
 
 async function activeOverleafTabId(): Promise<number | null> {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
-  return tabs.find((tab) => tab.url?.startsWith('https://www.overleaf.com/project/'))?.id ?? null;
+  return tabs.find((tab) => isOverleafProjectUrl(tab.url))?.id ?? null;
+}
+
+/**
+ * Must agree with the content script's match pattern in manifest.config.ts —
+ * a tab this accepts but the manifest excludes has no content script to answer,
+ * and one the manifest covers but this rejects silently loses "jump to source".
+ */
+function isOverleafProjectUrl(url: string | undefined): boolean {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    return (
+      parsed.protocol === 'https:' &&
+      (parsed.hostname === 'overleaf.com' || parsed.hostname.endsWith('.overleaf.com')) &&
+      parsed.pathname.startsWith('/project/')
+    );
+  } catch {
+    return false;
+  }
 }
 
 async function setState(patch: Partial<ExtensionState>): Promise<void> {
@@ -555,6 +514,10 @@ async function restoreState(): Promise<void> {
   const stored = await chrome.storage.session.get(STATE_STORAGE_KEY).catch(() => ({}));
   const restored = (stored as Record<string, unknown>)[STATE_STORAGE_KEY] as ExtensionState | undefined;
   if (restored) state = restored;
+  const token = await getBearerToken();
+  for (const claim of state.claimStates) {
+    if (claim.status === 'checking' && claim.runId) subscribeToRunEvents(claim.runId, claim.claimId, token);
+  }
 }
 
 function deriveClaimStates(claims: ParsedClaim[]): ClaimRuntimeState[] {
@@ -586,7 +549,7 @@ function mergeDesktopClaimStatuses(
     if (!status.runId && previous?.runId) continue;
 
     next = updateClaimRuntime(next, claim.id, {
-      status: status.status,
+      status: status.claimFingerprint && status.claimFingerprint !== claim.fingerprint ? 'stale' : status.status,
       runId: status.runId,
       phase: status.phase,
       lastMessage: status.message,
@@ -764,7 +727,7 @@ async function applyBearerToken(token: string | null): Promise<void> {
 
 async function startProvisionRun(force: boolean): Promise<void> {
   const token = await getBearerToken();
-  if (!token) throw new Error('Connect to desktop first — paste the bearer token.');
+  if (!token) throw new Error('Connect to the desktop app first.');
 
   const response = await fetch(`${DESKTOP_URL}/v1/provision`, {
     method: 'POST',
@@ -810,40 +773,18 @@ function subscribeToProvisionEvents(provisionId: string, token: string | null): 
         return;
       }
 
-      const reader = sseResponse.body.getReader();
-      const decoder = new TextDecoder();
-      let buffer = '';
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
-        const chunks = buffer.split('\n\n');
-        buffer = chunks.pop() ?? '';
-
-        for (const chunk of chunks) {
-          const dataLine = chunk.split('\n').find((l) => l.startsWith('data:'));
-          const eventLine = chunk.split('\n').find((l) => l.startsWith('event:'));
-          if (!dataLine) continue;
-
-          const data = JSON.parse(dataLine.slice(5).trim()) as Record<string, unknown>;
-          const eventName = eventLine?.slice(6).trim() ?? 'provision_event';
-
-          if (eventName === 'provision_event') {
-            const parsed = ProvisionEvent.safeParse(data);
-            if (parsed.success) {
-              const next = [...state.provisionEvents, parsed.data];
-              if (next.length > MAX_PROVISION_EVENTS) {
-                next.splice(0, next.length - MAX_PROVISION_EVENTS);
-              }
-              await setState({ provisionEvents: next });
-            }
-          } else if (eventName === 'complete') {
-            await refreshProvisionState(token);
-            // A completed provision changes Lean availability — re-check health.
-            await refreshDesktopState();
-            return;
+      for await (const frame of readSse(sseResponse.body)) {
+        if (frame.event === 'provision_event') {
+          const parsed = ProvisionEvent.safeParse(JSON.parse(frame.data));
+          if (parsed.success) {
+            await setState({
+              provisionEvents: [...state.provisionEvents, parsed.data].slice(-MAX_PROVISION_EVENTS),
+            });
           }
+        } else if (frame.event === 'complete') {
+          // A completed provision changes Lean availability — re-check health.
+          await refreshDesktopState();
+          return;
         }
       }
 
@@ -857,7 +798,7 @@ function subscribeToProvisionEvents(provisionId: string, token: string | null): 
 
 async function refreshProviderConfigs(token: string | null): Promise<void> {
   if (!token) {
-    await setState({ formalizerOptions: null, auxiliaryConfig: null });
+    await setState({ formalizerConfig: null, proposerConfig: null, auxiliaryConfig: null, hasOpenRouterKey: false });
     return;
   }
   try {
@@ -865,30 +806,43 @@ async function refreshProviderConfigs(token: string | null): Promise<void> {
       headers: authHeaders(token),
     });
     if (!response.ok) return;
-    const data = (await response.json()) as {
-      formalizerOptions: FormalizerOption[];
-      auxiliaryConfig: AuxiliaryConfigInfo | null;
-    };
-    await setState({ formalizerOptions: data.formalizerOptions, auxiliaryConfig: data.auxiliaryConfig });
+    const data = ProviderConfigsResponse.parse(await response.json());
+    await setState({
+      formalizerConfig: data.formalizerConfig,
+      proposerConfig: data.proposerConfig,
+      auxiliaryConfig: data.auxiliaryConfig,
+      hasOpenRouterKey: data.hasKey,
+    });
   } catch {
     // leave as-is on network error
   }
 }
 
-async function switchFormalizer(configId: string, optionKey: 'novita' | 'featherless'): Promise<void> {
-  const token = await getBearerToken();
-  const response = await fetch(`${DESKTOP_URL}/v1/provider-configs/${configId}`, {
-    method: 'PATCH',
-    headers: authHeaders(token),
-    body: JSON.stringify({ optionKey }),
+/**
+ * Asks the desktop to pair. The desktop shows a prompt; the person approves
+ * there, and the token comes back over this request — nothing to copy by hand.
+ * The call blocks for as long as the prompt is open, which is the point.
+ */
+async function requestPairing(): Promise<void> {
+  const response = await fetch(`${DESKTOP_URL}/v1/pair`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ clientName: 'lale Chrome extension' }),
   });
+
+  if (response.status === 403) throw new Error('The desktop app declined the connection.');
+  if (response.status === 409) throw new Error('Another connection request is already waiting for approval.');
+  if (response.status === 503) throw new Error('The desktop app cannot ask for approval right now. Is it running?');
   if (!response.ok) throw new Error(`Desktop app returned HTTP ${response.status}`);
-  await refreshProviderConfigs(token);
+
+  const { token } = await response.json() as { token?: unknown };
+  if (typeof token !== 'string' || !token.trim()) throw new Error('The desktop app returned no token.');
+  await applyBearerToken(token.trim());
 }
 
-async function setNamedProviderKey(provider: string, key: string): Promise<void> {
+async function setOpenRouterKey(key: string): Promise<void> {
   const token = await getBearerToken();
-  const response = await fetch(`${DESKTOP_URL}/v1/provider-keys/${encodeURIComponent(provider)}`, {
+  const response = await fetch(`${DESKTOP_URL}/v1/provider-keys/openrouter`, {
     method: 'PUT',
     headers: authHeaders(token),
     body: JSON.stringify({ key }),
@@ -897,9 +851,9 @@ async function setNamedProviderKey(provider: string, key: string): Promise<void>
   await refreshProviderConfigs(token);
 }
 
-async function clearNamedProviderKey(provider: string): Promise<void> {
+async function clearOpenRouterKey(): Promise<void> {
   const token = await getBearerToken();
-  const response = await fetch(`${DESKTOP_URL}/v1/provider-keys/${encodeURIComponent(provider)}`, {
+  const response = await fetch(`${DESKTOP_URL}/v1/provider-keys/openrouter`, {
     method: 'DELETE',
     headers: authHeaders(token),
   });

@@ -1,0 +1,59 @@
+{
+  "name": "@lale/desktop-app",
+  "version": "0.1.0",
+  "private": true,
+  "description": "macOS menu-bar shell around the lale desktop service",
+  "main": "dist/main.cjs",
+  "scripts": {
+    "build": "node build.mjs",
+    "start": "pnpm build && electron dist/main.cjs",
+    "dist": "pnpm build && electron-builder --mac dmg",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+    
+  },
+  "dependencies": {
+    "better-sqlite3": "^13.0.0"
+  },
+  "optionalDependencies": {
+    "keytar": "^7.9.0"
+  },
+  "devDependencies": {
+    "electron": "^44.0.0",
+    "electron-builder": "^25.0.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.6.3",
+    "@types/node": "^25.6.2",
+    "@lale/desktop": "workspace:*"
+  },
+  "build": {
+    "appId": "com.lale.desktop",
+    "productName": "lale",
+    "files": [
+      "dist/**/*",
+      "package.json"
+    ],
+    "directories": {
+      "output": "release"
+    },
+    "mac": {
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        }
+      ],
+      "category": "public.app-category.developer-tools",
+      "identity": null,
+      "extendInfo": {
+        "LSUIElement": true
+      }
+    },
+    "dmg": {
+      "title": "lale"
+    },
+    "asar": false,
+    "npmRebuild": false
+  }
+}

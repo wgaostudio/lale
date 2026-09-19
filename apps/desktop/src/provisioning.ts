@@ -25,7 +25,6 @@ interface ProvisionState {
   finishedAt: string | null;
   error: string | null;
   events: ProvisionEvent[];
-  current: ChildProcess | null;
 }
 
 const state: ProvisionState = {
@@ -38,7 +37,6 @@ const state: ProvisionState = {
   finishedAt: null,
   error: null,
   events: [],
-  current: null,
 };
 
 // ---------------------------------------------------------------------------
@@ -66,12 +64,27 @@ function broadcast(provisionId: string, eventName: string, data: unknown): void 
   for (const cb of sseSubscribers.get(provisionId) ?? []) cb(chunk);
 }
 
+/**
+ * Provisioning used to speak only over the event stream, so a failed install
+ * left nothing behind: the one real failure we hit had an empty log file and had
+ * to be diagnosed by replaying SSE. Now every event is also written to the log
+ * a person can be asked to send.
+ */
+type ProvisionLogSink = (level: ProvisionEvent['level'], message: string) => void;
+
+let logSink: ProvisionLogSink | null = null;
+
+export function setProvisionLogSink(sink: ProvisionLogSink | null): void {
+  logSink = sink;
+}
+
 function emit(
   step: ProvisionStep,
   level: ProvisionEvent['level'],
   message: string,
   payload?: Record<string, unknown>,
 ): void {
+  logSink?.(level, `[provision/${step}] ${message}`);
   if (!state.provisionId) return;
   const event: ProvisionEvent = {
     eventId: randomUUID(),
@@ -163,14 +176,6 @@ export function getPastEvents(provisionId: string): ProvisionEvent[] {
   return state.events.slice();
 }
 
-export function isProvisioning(): boolean {
-  return state.status === 'running';
-}
-
-export function defaultProjectDir(): string {
-  return process.env['LALE_LEAN_PROJECT_DIR'] ?? join(homedir(), '.lale', 'lean-project');
-}
-
 export function initProjectDir(dir: string): void {
   state.projectDir = dir;
 }
@@ -254,7 +259,6 @@ function runStep(
       shell: false,
       detached: true,
     });
-    state.current = child;
     trackChild(child);
 
     let stdout = '';
@@ -294,13 +298,11 @@ function runStep(
 
     child.on('error', (err) => {
       if (timer) clearTimeout(timer);
-      state.current = null;
       reject(err);
     });
 
     child.on('close', (code) => {
       if (timer) clearTimeout(timer);
-      state.current = null;
       resolve({ exitCode: code ?? 0, stdout, stderr, timedOut });
     });
   });
@@ -394,37 +396,8 @@ async function installElan(): Promise<void> {
     'curl -sSfL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh ' +
     '| sh -s -- -y --default-toolchain none';
 
-  const result = await new Promise<SpawnResult>((resolve, reject) => {
-    const child = spawn('bash', ['-c', installer], {
-      stdio: ['ignore', 'pipe', 'pipe'],
-      detached: true,
-    });
-    state.current = child;
-    trackChild(child);
-    let stdout = '';
-    let stderr = '';
-    child.stdout.on('data', (c: Buffer) => {
-      stdout += c.toString();
-      for (const line of c.toString().split('\n')) {
-        if (line.trim()) emit('installElan', 'info', line.trim());
-      }
-    });
-    child.stderr.on('data', (c: Buffer) => {
-      stderr += c.toString();
-      for (const line of c.toString().split('\n')) {
-        if (line.trim()) emit('installElan', 'warning', line.trim());
-      }
-    });
-    child.on('error', (err) => {
-      state.current = null;
-      reject(err);
-    });
-    child.on('close', (code) => {
-      state.current = null;
-      resolve({ exitCode: code ?? 0, stdout, stderr, timedOut: false });
-    });
-  });
-
+  // 15 min cap — this is one download; anything longer has stalled.
+  const result = await runStep('installElan', 'bash', ['-c', installer], { timeoutMs: 15 * 60_000 });
   if (result.exitCode !== 0) {
     throw new Error(`elan installer exited with code ${result.exitCode}`);
   }
@@ -474,7 +447,34 @@ async function lakeUpdate(env: NodeJS.ProcessEnv, projectDir: string): Promise<v
     timeoutMs: 30 * 60_000,
   });
   if (result.exitCode !== 0) {
-    throw new Error(`lake update exited with code ${result.exitCode}`);
+    // Not fatal on its own. `lake update` runs Mathlib's post-update cache hook,
+    // which has been seen to fetch every file and then exit non-zero over its
+    // own scratch config — on a first run, with no `~/.cache/mathlib` to start
+    // from. The authority on whether the toolchain works is `verify`, which
+    // compiles something; the cache step below runs either way and will report
+    // a genuinely missing cache.
+    emit(
+      'lakeUpdate',
+      'warning',
+      `lake update exited with code ${result.exitCode}; continuing to the cache step, `
+      + 'which decides whether the install is usable',
+    );
+  }
+}
+
+/**
+ * Mathlib's cache tool writes scratch files under `$XDG_CACHE_HOME`, or
+ * `~/.cache` when that is unset. A first run on a machine that has never had one
+ * is exactly where that goes wrong, so create it before lake is invoked.
+ */
+async function ensureMathlibCacheDir(env: NodeJS.ProcessEnv): Promise<void> {
+  const base = env['XDG_CACHE_HOME'] ?? join(env['HOME'] ?? homedir(), '.cache');
+  const dir = join(base, 'mathlib');
+  try {
+    await mkdir(dir, { recursive: true });
+    emit('lakeUpdate', 'info', `Mathlib cache directory ready at ${dir}`);
+  } catch (err) {
+    emit('lakeUpdate', 'warning', `Could not create ${dir}: ${String(err)}`);
   }
 }
 
@@ -587,6 +587,9 @@ async function runProvision(provisionId: string, input: StartProvisionInput): Pr
 
     await writeProject(input.projectDir, input.leanVersion, input.mathlibRevision);
     await installToolchain(env, input.leanVersion);
+    // Immediately before the first lake invocation, which is the step its
+    // events are filed under and the first thing that needs the directory.
+    await ensureMathlibCacheDir(env);
     await lakeUpdate(env, input.projectDir);
     await lakeCacheGet(env, input.projectDir);
     await verify(env, input.projectDir);

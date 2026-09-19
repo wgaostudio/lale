@@ -5,6 +5,8 @@
     "moduleResolution": "Bundler",
     "lib": ["ES2022", "DOM"],
     "strict": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
     "skipLibCheck": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
@@ -12,4 +14,3 @@
     "exactOptionalPropertyTypes": true
   }
 }
-

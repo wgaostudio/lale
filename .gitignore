@@ -1,8 +1,15 @@
 node_modules
 dist
+release/
 .turbo
 .DS_Store
 .env
 .env.*
 !.env.example
 
+
+reports/
+tests/.runner-*/
+tests/.service-*/
+tests/lean/.lake/
+tests/lean/Checks/
