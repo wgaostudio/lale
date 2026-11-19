@@ -46,6 +46,9 @@ export type RunPhase = z.infer<typeof RunPhase>;
 export const VerificationOutcome = z.enum([
   'formalized',
   'verified',
+  // The author's argument holds in Lean given the results it cites, which are
+  // stated and screened but not proved. Not a pass of the theorem.
+  'verifiedGivenCitations',
   'malformedClaim',
   'malformedProof',
   'proofIncomplete',
@@ -90,6 +93,7 @@ export const ExtensionClaimStatus = z.enum([
   'pending',
   'formalized',
   'verified',
+  'verifiedGivenCitations',
   'verifiedByOverride',
   'stale',
   'blocked',

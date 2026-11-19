@@ -9,10 +9,11 @@ import { fillObligation, parseObligation, type LeanDiagnostic } from '@lale/lean
 // the copy taken before the agent started, so no edit can reach it.
 //
 // Lean checks one file, so the helper files are concatenated in order ahead of
-// the theorem. Each file is wrapped in nothing: a namespace or section it opens
-// it must close, and if it does not, the theorem lands in that namespace and
-// the kernel certificate (which looks the theorem up by its root name) fails.
-// That failure is the enforcement; this module only reports it legibly.
+// the theorem, each wrapped in the claim's helper namespace (`LaleAux.<name>`).
+// A namespace or section a file opens it must close; if it does not, the
+// harness's closing `end` fails to elaborate, or the theorem lands in the wrong
+// namespace and the kernel certificate (which looks it up by its root name)
+// fails. That failure is the enforcement; this module only reports it legibly.
 // ---------------------------------------------------------------------------
 
 export const MAX_WORKSPACE_FILES = 64;
@@ -65,6 +66,13 @@ export class Workspace {
   private order: string[] = [];
   private proofBody = '';
 
+  /**
+   * Every helper file is wrapped in this namespace. Accepted proofs are stored
+   * with their helpers and later composed into other claims' files, so two
+   * agents that both wrote `lemma key_bound` would otherwise collide.
+   */
+  readonly helperNamespace: string;
+
   constructor(
     readonly frozen: FrozenTheorem,
     /** Accepted declarations this claim may cite; harness-owned. */
@@ -73,6 +81,7 @@ export class Workspace {
     // Fail at construction, not at the first check, if the header is not a
     // frozen obligation the harness knows how to fill.
     parseObligation(frozen.leanSource, frozen.theoremName);
+    this.helperNamespace = helperNamespaceFor(frozen.theoremName);
   }
 
   get paths(): readonly string[] {
@@ -167,13 +176,13 @@ export class Workspace {
 
     const header = splitImports(this.frozen.leanSource);
     const deps = splitImports(this.dependencyDeclarations);
-    const parts: Array<{ label: string; text: string }> = [];
+    const parts: Array<{ label: string; text: string; wrap?: string }> = [];
     const imports = new Set<string>([...header.imports, ...deps.imports]);
     if (deps.body && options.includeDependencies !== false) parts.push({ label: '<dependencies>', text: deps.body });
     for (const path of paths) {
       const file = splitImports(this.files.get(path)!);
       for (const module of file.imports) imports.add(module);
-      parts.push({ label: path, text: file.body });
+      parts.push({ label: path, text: file.body, wrap: this.helperNamespace });
     }
     if (options.suffix !== undefined) parts.push({ label: '<probe>', text: options.suffix.replace(/\s+$/, '') });
     if (includeTheorem) {
@@ -191,9 +200,11 @@ export class Workspace {
     }
     for (const part of parts) {
       lines.push('');
+      if (part.wrap) lines.push(`namespace ${part.wrap}`);
       const partLines = part.text ? part.text.split('\n') : [];
       segments.push({ label: part.label, startLine: lines.length + 1, lineCount: partLines.length });
       lines.push(...partLines);
+      if (part.wrap) lines.push(`end ${part.wrap}`);
     }
     return { source: `${lines.join('\n')}\n`, segments };
   }
@@ -206,6 +217,11 @@ export class Workspace {
   acceptedSource(): string {
     return this.compose({ includeTheorem: true, includeDependencies: false }).source;
   }
+}
+
+/** `LaleAux.<theorem>`: theorem names are simple identifiers, so this is a valid namespace. */
+export function helperNamespaceFor(theoremName: string): string {
+  return `LaleAux.${theoremName}`;
 }
 
 /** Maps a composed-source line back to `File.lean:line`. */

@@ -1,4 +1,4 @@
-import { scanTrustViolations, sameObligation } from '@lale/lean-runner';
+import { containsObligation, scanTrustViolations, sameObligation } from '@lale/lean-runner';
 import type { VerificationOutcome, FaithfulnessVerdict } from '@lale/protocol';
 import type { FormalizeResult } from './formalize.js';
 import type { FaithfulnessCheckResult } from './faithfulness.js';
@@ -47,7 +47,10 @@ export function runFinalGate(
   // Frozen theorem statement must match. A proposal is allowed to replace
   // `:= by sorry` with a real proof, but not to alter binders, assumptions, or
   // the conclusion.
-  if (!sameObligation(frozenHeader.leanSource, leanSource, frozenHeader.theoremName)) {
+  // A proof built from helpers or the author's steps carries more than one
+  // declaration; it must still contain the frozen header verbatim.
+  if (!sameObligation(frozenHeader.leanSource, leanSource, frozenHeader.theoremName)
+    && !containsObligation(frozenHeader.leanSource, leanSource, frozenHeader.theoremName)) {
     violations.push('Proof changed the frozen theorem statement or environment');
   }
 

@@ -16,7 +16,11 @@ This distinction matters more than any other in the project, so it comes first.
 |---|---|---|
 | **Verify** (`full`) | Formalizes the statement, then asks a model to write a Lean proof of it. | The theorem is true in Lean + Mathlib. **Your written proof was not audited** — the model may close the goal by an entirely different route. |
 | **Formalize only** | Formalizes the statement and runs the faithfulness checks. No proof attempt. | The statement can be expressed precisely and the formalization matches your prose. Cheap, and the fastest way to find ambiguity. |
-| **Check proof steps** (`proofSkeleton`) | Splits *your* proof into the steps it argues, states each in Lean under the theorem's hypotheses, proves each, then checks they compose. | Your argument holds up, step by step — and a gap is localised to a step. |
+| **Check proof steps** (`proofSkeleton`) | Splits *your* proof into the steps it argues and the results it cites. States each step in Lean, with the cited results it uses as hypotheses, checks the statement reads back as your step, proves it, then checks the steps compose to the theorem in a short proof. | Your argument holds up, step by step — and a gap is localised to a step, with the prover's account of what is missing. If you cite results lale does not prove, the pass is `verifiedGivenCitations`: your argument is checked *given* them. |
+
+This is the mode lale is built around. A prover left free to prove a theorem
+will often find its own route — on research mathematics, usually a different
+one — and a pass then says nothing about the proof on the page.
 
 Lean's kernel is the thing that proves. The model that writes candidate proofs is
 called the **proposer**, because proposing is what it does; a rejected proposal
@@ -108,15 +112,25 @@ without a stored mode default to `full`.
   integration remain manual checks. The obsolete `test:lean` command was removed.
 - `pnpm evals` checks three bundled fixtures. Running with `--live` uses a running
   desktop service and paid model requests, and requires `LALE_DESKTOP_TOKEN`.
-- An agentic prover (`apps/desktop/src/pipeline/agent/`) is built and tested
-  offline but not yet wired into runs. It works through typed tools (helper
-  files, Lean checks with `sorry` allowed, `exact?` probes, `#check` lookups,
-  Mathlib declaration search) for as many turns as a per-claim dollar budget
-  allows: a hard ceiling, and a floor below which a give-up is refused and the
-  agent is sent back to work. A proof is accepted only by a clean-room gate:
-  the frozen statement spliced in verbatim, no trust allowances, standard
-  axioms only, and the kernel's goal term equal to the one frozen before the
-  agent started. Defaults are $5 ceiling and $1 floor per claim.
+- **Check proof steps** uses an agentic prover (`apps/desktop/src/pipeline/agent/`)
+  when model prices are known. Per step, it works through typed tools (helper
+  files in a per-theorem namespace, Lean checks with `sorry` allowed, `exact?`
+  probes, `#check` lookups, Mathlib declaration search) within a dollar budget
+  ($2 ceiling, $0.25 floor per step by default; below the floor a give-up is
+  refused). It is told to justify the author's step, not to find its own route,
+  and the step's statement is frozen so it cannot. Composition gets no helper
+  files and at most 30 lines. Acceptance is a clean-room gate: the frozen
+  statement spliced in verbatim, no trust allowances, standard axioms only, and
+  the kernel's goal term equal to the one frozen beforehand. Without prices,
+  steps fall back to the one-shot prover. Verify mode still uses the one-shot
+  prover; the agent's free-route mode exists for it but is not wired in.
+- Cited results are `def laleCiteN : Prop` premises, never axioms. Each is
+  back-translated against the author's wording and tried for a cheap refutation
+  (a false premise would make every step after it vacuous); one Mathlib can
+  prove is discharged. A subtly false or overstated citation can still slip
+  through, which is why `verifiedGivenCitations` lists them for the author to
+  review. Claims citing a `verifiedGivenCitations` claim do not treat it as
+  verified.
 - Default models are GPT-6.2 Astra for every role, with Claude Fable 5.2 as the
   supported alternative (`SUPPORTED_PROVER_MODELS`).
 - Proof generation in runs today is generate-and-check, not proof search: one model call

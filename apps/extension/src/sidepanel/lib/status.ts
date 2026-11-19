@@ -34,6 +34,7 @@ export function isRunning(status: string): boolean {
 export function formatDocumentItemStatus(claim: ParsedClaim, status: string): string {
   if (isVerifiableClaim(claim)) {
     if (status === 'verifiedByOverride') return 'override verified';
+    if (status === 'verifiedGivenCitations') return 'verified given citations';
     if (status === 'checking') return 'checking';
     return status;
   }

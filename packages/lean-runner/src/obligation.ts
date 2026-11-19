@@ -36,6 +36,27 @@ export function sameObligation(frozen: string, accepted: string, name: string): 
   try { return parseObligation(frozen, name).header === parseObligation(accepted, name).header; }
   catch { return false; }
 }
+/**
+ * For an accepted proof that carries more than the theorem — helper lemmas,
+ * the author's proved steps — `sameObligation` cannot apply: it parses a file
+ * of exactly one theorem. This is its multi-declaration counterpart. The
+ * frozen header, minus its imports (which a composed file hoists), must occur
+ * verbatim, and nothing else may declare that name. The kernel certificate on
+ * recheck is what pins the proposition; this pins the text.
+ */
+export function containsObligation(frozen: string, accepted: string, name: string): boolean {
+  try {
+    const header = parseObligation(frozen, name).header
+      .split('\n').filter((line) => !/^\s*import\s/.test(line)).join('\n').trim();
+    if (!header || !accepted.includes(header)) return false;
+    const code = stripLeanCommentsAndStrings(accepted);
+    const escaped = name.replace(/[.*+?^${}()|[\]\\']/g, '\\$&');
+    const declarations = code.match(new RegExp(`\\b(?:theorem|lemma|def|abbrev|instance|axiom|opaque)\\s+${escaped}(?![A-Za-z0-9_'.])`, 'g'));
+    return declarations?.length === 1;
+  } catch {
+    return false;
+  }
+}
 export function equivalenceObligation(s1: string, s2: string): string {
   const a = parseObligation(s1), b = parseObligation(s2);
   const imports = new Set<string>();

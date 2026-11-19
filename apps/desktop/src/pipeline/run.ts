@@ -7,7 +7,7 @@ import {
   type ParsedDocument,
 } from '@lale/document-parser';
 import { LeanCheckCache, deriveCacheKey, type CacheKey } from '@lale/cache';
-import { LeanRunner } from '@lale/lean-runner';
+import { LeanRunner, containsObligation } from '@lale/lean-runner';
 import { RunBudget, ModelClient, informalAudit as runInformalAudit } from '@lale/translator';
 import type { VerificationOutcome, RunPhase } from '@lale/protocol';
 import type { AuditRunRow, ProviderConfigRow } from '../db.js';
@@ -30,6 +30,8 @@ import { checkDefinitionFaithfulness, checkFaithfulness } from './faithfulness.j
 import { runProposer, type ProposerResult } from './proposer.js';
 import { ACCEPTABLE_FAITHFULNESS, runFinalGate } from './gate.js';
 import { checkProofSkeleton } from './proof-steps.js';
+import type { AgentEvent } from './agent/prover.js';
+import { mathlibSourceRoot } from './agent/mathlib-search.js';
 import { validateCachedProof } from './cache-proof.js';
 import { extractLeanImports, getMathlibImportIndex } from './mathlib-index.js';
 import type { VerificationMode } from '@lale/protocol';
@@ -171,6 +173,10 @@ function claimStatusForOutcome(outcome: VerificationOutcome): string {
   switch (outcome) {
     case 'verified':
       return 'verified';
+    // Its own status, never `verified`: claims that cite it must not inherit a
+    // pass that rests on unproved citations.
+    case 'verifiedGivenCitations':
+      return 'verifiedGivenCitations';
     case 'formalized':
       return 'formalized';
     case 'dependencyMissing':
@@ -537,6 +543,25 @@ export interface PipelineInput {
 
 /** Per-run caps, used both to start a run and to rehydrate a paused one. */
 export const DEFAULT_TOKEN_BUDGET_CAP = 250_000;
+
+// The agent's own ledger: a runaway guard only. Its dollar budgets bound spend.
+const AGENT_LEDGER_TOKEN_CAP = 2_000_000_000;
+const AGENT_LEDGER_MAX_CALLS = 20_000;
+/** Agent turns are logged every this many turns, not every turn. */
+const AGENT_TURN_EVENT_EVERY = 10;
+
+function describeAgentEvent(scope: string, event: AgentEvent): string {
+  switch (event.type) {
+    case 'turn':
+      return `Agent (${scope}): turn ${event.turn}, ${formatUsd(event.spentUsd)} spent`;
+    case 'pushback':
+      return `Agent (${scope}) tried to give up at ${formatUsd(event.spentUsd)}; sent back to work (floor ${formatUsd(event.floorUsd)})`;
+    case 'stop':
+      return `Agent (${scope}) stopped: ${event.reason} after ${event.turn} turns, ${formatUsd(event.spentUsd)}`;
+    case 'tool':
+      return `Agent (${scope}): ${event.tool}`;
+  }
+}
 export const DEFAULT_WALL_CLOCK_CAP_MS = 60_000;
 
 export interface PipelineConfig {
@@ -776,6 +801,8 @@ async function executePipeline(
     // that point the steps are part of the claim's environment.
     let proposerContext = context;
     let depDecls = formatDependencyDeclarations(context.resolvedDependencies);
+    /** Set when proof-steps mode proved the theorem from the author's steps. */
+    let composedProof: string | null = null;
 
     // ── §3.5 Informal advisory audit ─────────────────────────────────────
     if (targetNeedsProof && !options.skipInformalAudit) {
@@ -1092,13 +1119,33 @@ async function executePipeline(
       emit('proofSteps', 'info', "Formalizing the author's proof, step by step");
       updateRunStatus(db, auditRunId, 'running', 'proofSteps');
 
+      // The agent needs prices to budget in dollars. Without them (a local
+      // provider, an offline price list) steps fall back to the one-shot path.
+      // Its client has its own ledger: an agent re-sends its whole history
+      // each turn, which the run's token cap was never sized for. The agent's
+      // dollar ceilings are what bound its spend.
+      const agentConfig = budget.pricing
+        ? {
+            client: await buildModelClient(db, config.proposerConfigId,
+              new RunBudget(AGENT_LEDGER_TOKEN_CAP, 0, 0, AGENT_LEDGER_MAX_CALLS), emit, auditRunId),
+            pricing: budget.pricing,
+            mathlibRoot: mathlibSourceRoot(input.leanProjectDir),
+            onEvent: (scope: string, event: AgentEvent) => {
+              if (event.type === 'turn' && event.turn % AGENT_TURN_EVENT_EVERY !== 0) return;
+              if (event.type === 'tool') return;
+              emit('proofSteps', event.type === 'pushback' ? 'warning' : 'info', describeAgentEvent(scope, event), { scope, ...event });
+            },
+          }
+        : undefined;
+      if (!agentConfig) emit('proofSteps', 'info', 'Model prices unavailable; steps get the one-shot prover');
+
       const skeleton = await withHeartbeat(
         () => checkProofSkeleton(
           auxiliaryClient,
           formalizerClient,
           proposerClient,
           runner,
-          formalized.leanSource,
+          { leanSource: formalized.leanSource, theoremName: formalized.theoremName, normalizedGoalTerm: formalized.normalizedGoalTerm },
           context,
           config.leanVersion,
           config.mathlibRevision,
@@ -1110,10 +1157,24 @@ async function executePipeline(
             // environment. Step formalization was the one path getting no
             // import hints at all.
             mathlibImportHints: extractLeanImports(formalized.leanSource),
+            ...(agentConfig ? { agent: agentConfig } : {}),
           },
         ),
         heartbeatTick(emit, 'proofSteps', 'Proof steps'),
       );
+      if (skeleton.agentSpendUsd > 0) {
+        emit('proofSteps', 'info', `Agent spend on the proof's steps: ${formatUsd(skeleton.agentSpendUsd)}`);
+      }
+
+      for (const citation of skeleton.citations) {
+        emit(
+          'proofSteps',
+          citation.status === 'assumed' || citation.status === 'discharged' ? 'info' : 'warning',
+          `Cited result ${citation.idx} (${citation.name}) ${citation.status}: ${citation.reason}`,
+          { citation: citation.idx, status: citation.status, statement: citation.statement,
+            leanSource: citation.leanSource, backtranslation: citation.backtranslation },
+        );
+      }
 
       for (const step of skeleton.steps) {
         db.prepare(
@@ -1128,14 +1189,20 @@ async function executePipeline(
           JSON.stringify({
             claim: step.claim,
             uses: step.uses,
+            cites: step.cites.map((i) => {
+              const c = skeleton.citations[i - 1];
+              return c ? { idx: c.idx, name: c.name, status: c.status } : { idx: i };
+            }),
             leanSource: step.leanSource,
             theoremName: step.theoremName,
+            backtranslation: step.backtranslation ?? null,
             diagnostics: step.diagnostics,
             proof: step.proof,
           }),
         );
 
         const ok = step.status === 'checked' && step.proof.status === 'proved';
+        const unprovedDetail = step.proof.report ? `${step.proof.report}` : step.proof.diagnostics.join('; ');
         emit(
           'proofSteps',
           ok ? 'info' : 'warning',
@@ -1143,8 +1210,9 @@ async function executePipeline(
             ? `Step ${step.idx} proved (${step.proof.closedBy}): ${step.claim}`
             : step.status !== 'checked'
               ? `Step ${step.idx} could not be stated in Lean (${step.status}): ${step.claim} — ${step.diagnostics.join('; ').slice(0, 400)}`
-              : `Step ${step.idx} stated but not proved: ${step.claim} — ${step.proof.diagnostics.join('; ').slice(0, 400)}`,
-          { idx: step.idx, status: step.status, proof: step.proof.status, closedBy: step.proof.closedBy },
+              : `Step ${step.idx} stated but not proved: ${step.claim} — ${unprovedDetail.slice(0, 600)}`,
+          { idx: step.idx, status: step.status, proof: step.proof.status, closedBy: step.proof.closedBy,
+            ...(step.proof.report ? { report: step.proof.report } : {}) },
         );
       }
 
@@ -1157,35 +1225,92 @@ async function executePipeline(
         + `${skeleton.steps.length - unproved.length}/${skeleton.steps.length} proved`,
       );
 
+      const budgetLine = (): void => emit(
+        'finalGate',
+        'info',
+        `Budget used: ${budget.inputTokens + budget.outputTokens} / ${budget.cap} tokens${formatSpend(budget)}`
+        + (skeleton.agentSpendUsd > 0 ? `, plus ${formatUsd(skeleton.agentSpendUsd)} agent spend` : ''),
+      );
+
       if (skeleton.steps.length === 0 || unstated.length > 0 || unproved.length > 0) {
-        emit(
-          'finalGate',
-          'info',
-          `Budget used: ${budget.inputTokens + budget.outputTokens} / ${budget.cap} tokens${formatSpend(budget)}`,
-        );
+        budgetLine();
         // The argument did not survive in full, so the claim is not established
         // by it — whatever the theorem's truth may be.
         finish('proofIncomplete');
         return;
       }
 
-      // Every step of the author's argument holds. What remains is whether they
-      // compose to the theorem, which the ordinary proposer stage now answers with
-      // the steps in scope as lemmas.
-      const stepDependencies: ResolvedDependency[] = skeleton.provedSources.map((leanSource, index) => ({
-        fingerprint: sha256(leanSource),
-        label: `proof-step-${index + 1}`,
-        kind: 'proof',
-        statementText: skeleton.steps[index]?.claim ?? '',
-        leanDeclaration: leanSource,
-        verified: true,
-      }));
-      proposerContext = {
-        ...context,
-        resolvedDependencies: [...context.resolvedDependencies, ...stepDependencies],
-      };
-      depDecls = formatDependencyDeclarations(proposerContext.resolvedDependencies);
-      emit('proofSteps', 'info', 'Every step holds — attempting to compose them into the claim');
+      const composition = skeleton.composition;
+      if (composition.status === 'unproved') {
+        emit('proofSteps', 'warning',
+          `Every step holds, but they do not compose to the theorem: ${(composition.report ?? composition.diagnostics.join('; ')).slice(0, 600)}`,
+          { composition });
+        budgetLine();
+        finish('proofIncomplete');
+        return;
+      }
+
+      if (composition.status === 'proved' && composition.leanSource) {
+        if (composition.conditionalOn.length > 0) {
+          // A pass of `cites → theorem`. Recheck it like any accepted proof,
+          // and hold it to the same faithfulness bar, but report it as what it is.
+          const conditionalName = `${formalized.theoremName}_givenCitations`;
+          const recheck = await runner.check(composeLeanFile(depDecls, composition.leanSource), { declarationName: conditionalName });
+          if (recheck.status !== 'ok' || !recheck.certificate || !composition.obligation
+            || !containsObligation(composition.obligation, composition.leanSource, conditionalName)) {
+            emit('finalGate', 'error', 'Final kernel recheck of the composed proof failed', { diagnostics: recheck.diagnostics });
+            budgetLine();
+            finish('verificationBlocked');
+            return;
+          }
+          const faithful = ACCEPTABLE_FAITHFULNESS.has(faithfulness.verdict);
+          db.prepare(
+            `INSERT INTO final_proof_artifacts
+               (finalProofId, auditRunId, leanSource, leanSourceHash, cacheKey,
+                trustPolicyViolationsJson, finalDiagnosticsJson, acceptedByLean, createdAt)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          ).run(
+            randomUUID(), auditRunId, composition.leanSource, sha256(composition.leanSource), null,
+            JSON.stringify(faithful ? [] : [`Faithfulness check failed: ${faithfulness.verdict}`]),
+            JSON.stringify([`Conditional on: ${composition.conditionalOn.join(', ')}`]), 1, new Date().toISOString(),
+          );
+          const assumed = skeleton.citations.filter((c) => composition.conditionalOn.includes(c.leanName));
+          emit('finalGate', 'info',
+            `The argument holds given ${assumed.length} cited result${assumed.length === 1 ? '' : 's'}: ${assumed.map((c) => c.name).join('; ')}`,
+            { conditionalOn: assumed.map((c) => ({ idx: c.idx, name: c.name, statement: c.statement })) });
+          budgetLine();
+          finish(faithful ? 'verifiedGivenCitations' : 'proofDoesNotSupportClaim');
+          return;
+        }
+        // An unconditional proof of the frozen theorem, built from the
+        // author's steps. It goes through the same recheck and gate as any
+        // other accepted proof.
+        composedProof = composition.leanSource;
+        emit('proofSteps', 'info', `Every step holds and they compose to the theorem (${composition.closedBy})`);
+      } else {
+        // No agent: the pre-agent behaviour, with the steps (and any citation
+        // definitions they mention) in scope for the ordinary proposer.
+        const stepSources = [
+          ...(skeleton.citationPrelude ? [{ source: skeleton.citationPrelude, label: 'citations', claim: 'cited results' }] : []),
+          ...skeleton.provedSources.map((source, index) => ({
+            source, label: `proof-step-${index + 1}`, claim: skeleton.steps[index]?.claim ?? '',
+          })),
+        ];
+        const stepDependencies: ResolvedDependency[] = stepSources.map(({ source, label, claim }) => ({
+          fingerprint: sha256(source),
+          label,
+          kind: 'proof',
+          statementText: claim,
+          leanDeclaration: source,
+          verified: true,
+        }));
+        proposerContext = {
+          ...context,
+          resolvedDependencies: [...context.resolvedDependencies, ...stepDependencies],
+        };
+        depDecls = formatDependencyDeclarations(proposerContext.resolvedDependencies);
+        emit('proofSteps', 'info', 'Every step holds — attempting to compose them into the claim');
+      }
     }
 
     if (!targetNeedsProof) {
@@ -1207,9 +1332,17 @@ async function executePipeline(
 
     let proposerResult: ProposerResult;
 
-    const cachedSource = cacheHit?.status === 'ok'
+    const cachedSource = composedProof === null && cacheHit?.status === 'ok'
       ? await validateCachedProof(cacheHit.provenByJson, formalized, depDecls, runner) : null;
-    if (cachedSource) {
+    if (composedProof !== null) {
+      // Proved from the author's steps above; the recheck below is the authority.
+      proposerResult = {
+        outcome: 'verified',
+        acceptedLeanSource: composedProof,
+        attempts: [],
+        totalUsage: { inputTokens: 0, outputTokens: 0 },
+      };
+    } else if (cachedSource) {
       emit('proposerAttempt', 'info', 'Cached proof passed fresh kernel validation — skipping model', { cacheKey: cacheHit?.cacheKey });
       proposerResult = {
         outcome: 'verified',

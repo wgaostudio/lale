@@ -331,3 +331,55 @@ test('chat wire format: tool calls and reasoning state round-trip', async () => 
   assert.deepEqual(body['reasoning'], { effort: 'high' });
   assert.equal(body['max_tokens'], 1000);
 });
+
+test('composition mode offers no file tools, refuses them if called, and caps the proof length', async () => {
+  const { runner } = fakeRunner();
+  const offered: string[][] = [];
+  const turns: Turn[] = [
+    [{ name: 'write_file', args: { path: 'Sneaky.lean', content: 'theorem big : True := trivial' } }],
+    [{ name: 'set_proof', args: { body: Array.from({ length: 5 }, () => 'skip').join('\n') } }, { name: 'submit', args: {} }],
+    [{ name: 'set_proof', args: { body: 'exact step2' } }, { name: 'submit', args: {} }],
+  ];
+  let index = 0;
+  const seen: ChatMessage[][] = [];
+  const client = {
+    async chat(messages: ChatMessage[], tools: ChatToolSpec[]) {
+      offered.push(tools.map((t) => t.name));
+      seen.push(structuredClone(messages));
+      const turn = turns[index++] as Array<{ name: string; args: Record<string, unknown> }>;
+      return { message: { role: 'assistant' as const, content: null,
+        toolCalls: turn.map((c, i) => ({ id: `k${index}_${i}`, name: c.name, arguments: JSON.stringify(c.args) })) },
+        finishReason: 'tool_calls', reasoning: null, usage: { inputTokens: 10, outputTokens: 10 } };
+    },
+  } as unknown as ModelClient;
+  const result = await runAgentProver({
+    ...base, client, runner,
+    purpose: { kind: 'composition', steps: [{ leanName: 'step2', text: 'the conclusion' }], citations: [], maxProofLines: 3 },
+  });
+  assert.equal(result.outcome, 'verified');
+  assert.ok(!offered[0]!.includes('write_file') && offered[0]!.includes('set_proof'));
+  const replies = seen.flat().filter((m) => m.role === 'tool').map((m) => (m as { content: string }).content);
+  assert.ok(replies.some((r) => r.includes('write_file is not available')));
+  assert.ok(replies.some((r) => r.includes('the proof is 5 lines; at most 3')));
+  assert.equal(result.workspace.files.length, 0);
+  assert.match((seen[0]![0] as { content: string }).content, /follows from the author's proved steps/);
+});
+
+test('author-step prompts frame the step as the author asserts it, not as a free proof', async () => {
+  const { runner } = fakeRunner();
+  const { client, seen } = scriptedClient([[{ name: 'give_up', args: { report: 'gap: step 2 needs compactness' } }]]);
+  const result = await runAgentProver({
+    ...base, client, runner, budget: { ceilingUsd: 1, floorUsd: 0 },
+    purpose: { kind: 'authorStep', index: 2, total: 3, claim: 'the set is bounded', sourceText: 'Clearly bounded.',
+      earlierSteps: [{ leanName: 'step1', text: 'f is continuous' }],
+      citations: [{ leanName: 'laleCite1', text: 'Heine–Borel' }] },
+  });
+  assert.equal(result.report, 'gap: step 2 needs compactness');
+  const [system, user] = seen[0]! as Array<{ content: string }>;
+  assert.match(system!.content, /check ONE step of the author's proof/);
+  assert.doesNotMatch(system!.content, /hint, not a requirement/);
+  assert.match(user!.content, /step 2 of 3\nthe set is bounded/);
+  assert.match(user!.content, /`step1`: f is continuous/);
+  assert.match(user!.content, /`laleCite1`: Heine–Borel/);
+  assert.match(user!.content, /`LaleAux\.target`/);
+});

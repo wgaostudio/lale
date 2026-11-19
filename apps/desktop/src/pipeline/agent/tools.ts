@@ -28,6 +28,24 @@ export interface ToolContext {
   checkTimeoutMs: number;
   /** Root holding Mathlib's `Mathlib/` sources, or null when search is unavailable. */
   mathlibRoot: string | null;
+  /** Tools this agent was offered; a call to any other is refused. Default: all. */
+  allowedTools?: ReadonlySet<string>;
+  /** Extra conditions on an accepted proof (composition mode). */
+  gateConstraints?: GateConstraints;
+}
+
+export interface GateConstraints {
+  /** Reject a proof body longer than this many non-blank lines. */
+  maxProofLines?: number;
+  /** Reject when the workspace holds any helper file. */
+  noHelperFiles?: boolean;
+}
+
+/** File-writing tools; composition mode is offered none of them. */
+export const HELPER_FILE_TOOLS = ['write_file', 'edit_file', 'read_file', 'delete_file', 'reorder_files'] as const;
+
+export function toolsFor(allowed: ReadonlySet<string> | undefined): ChatToolSpec[] {
+  return allowed ? AGENT_TOOLS.filter((t) => allowed.has(t.name)) : AGENT_TOOLS;
 }
 
 export type ToolControl =
@@ -188,6 +206,9 @@ export async function executeTool(ctx: ToolContext, name: string, rawArguments: 
   }
 
   const ws = ctx.workspace;
+  if (ctx.allowedTools && !ctx.allowedTools.has(name)) {
+    return ok(`Error: ${name} is not available in this run. Available: ${[...ctx.allowedTools].join(', ')}.`);
+  }
   try {
     switch (name) {
       case 'write_file': {
@@ -340,9 +361,21 @@ export interface GateVerdict {
  * instance, an `open`, a shadowing definition): the text is the same, the
  * proposition is not.
  */
-export async function finalGate(ws: Workspace, runner: LeanRunner, checkTimeoutMs: number): Promise<GateVerdict> {
+export async function finalGate(
+  ws: Workspace,
+  runner: LeanRunner,
+  checkTimeoutMs: number,
+  constraints: GateConstraints = {},
+): Promise<GateVerdict> {
   const reject = (reason: string): GateVerdict => ({ accepted: false, reason, leanSource: null, environmentFault: false });
   if (!ws.proof.trim()) return reject('No proof body is set; call set_proof first.');
+  if (constraints.noHelperFiles && ws.paths.length > 0) {
+    return reject('Rejected: this proof must use no helper files.');
+  }
+  const proofLines = ws.proof.split('\n').filter((line) => line.trim()).length;
+  if (constraints.maxProofLines !== undefined && proofLines > constraints.maxProofLines) {
+    return reject(`Rejected: the proof is ${proofLines} lines; at most ${constraints.maxProofLines} are allowed here. A longer argument means the steps do not yet carry the proof.`);
+  }
 
   const composition = ws.compose();
   const headerText = parseObligation(ws.frozen.leanSource, ws.frozen.theoremName).header
@@ -373,7 +406,7 @@ export async function finalGate(ws: Workspace, runner: LeanRunner, checkTimeoutM
 }
 
 async function submit(ctx: ToolContext): Promise<ToolOutcome> {
-  const verdict = await finalGate(ctx.workspace, ctx.runner, ctx.checkTimeoutMs);
+  const verdict = await finalGate(ctx.workspace, ctx.runner, ctx.checkTimeoutMs, ctx.gateConstraints);
   if (verdict.environmentFault) return { content: `Lean is unavailable: ${verdict.reason}`, control: { kind: 'environmentFault', message: verdict.reason } };
   if (verdict.accepted) return { content: 'Accepted by the clean-room check.', control: { kind: 'accepted', leanSource: verdict.leanSource! } };
   return ok(verdict.reason);

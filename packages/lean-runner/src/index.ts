@@ -7,6 +7,7 @@ export {
   parseObligation,
   fillObligation,
   sameObligation,
+  containsObligation,
   equivalenceObligation,
   fillEquivalence,
 } from './obligation.js';
