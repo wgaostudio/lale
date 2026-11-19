@@ -48,6 +48,11 @@ export interface LeanRunnerConfig {
 export interface LeanCheckOptions {
   allowTrustViolations?: string[];
   declarationName?: string;
+  /**
+   * Overrides the runner's wall-clock cap for this check. A many-file agent
+   * workspace takes longer to elaborate than a single obligation does.
+   */
+  wallClockCapMs?: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -290,7 +295,7 @@ export class LeanRunner {
       const preamble = name === undefined ? '' : 'import Lean\n';
       await writeFile(tmpFile, `${preamble}${source}\n${probe}`, 'utf8');
 
-      const result = await this.runLean(tmpFile);
+      const result = await this.runLean(tmpFile, options.wallClockCapMs);
       if (name === undefined || result.status !== 'ok') return result;
       return applyCertificate(result, marker, name, options.allowTrustViolations ?? []);
     } catch (error) {
@@ -325,8 +330,11 @@ export class LeanRunner {
     }
   }
 
-  private runLean(filePath: string): Promise<LeanCheckResult> {
+  private runLean(filePath: string, capOverrideMs?: number): Promise<LeanCheckResult> {
     const startMs = Date.now();
+    const wallClockCapMs = capOverrideMs !== undefined && Number.isSafeInteger(capOverrideMs) && capOverrideMs > 0
+      ? capOverrideMs
+      : this.wallClockCapMs;
     const memoryKb = Number(this.config.memoryCap ?? defaultMemoryCapKb());
     const memoryMb = Math.max(1, Math.floor(memoryKb / 1024));
     const args = [
@@ -385,7 +393,7 @@ export class LeanRunner {
       const timer = setTimeout(() => {
         timedOut = true;
         kill();
-      }, this.wallClockCapMs);
+      }, wallClockCapMs);
 
       child.on('error', (error) => { spawnError = error; });
 
@@ -398,7 +406,7 @@ export class LeanRunner {
           status = 'timeout';
           diagnostics.push({
             kind: 'error',
-            message: `Lean timed out after ${this.wallClockCapMs}ms`,
+            message: `Lean timed out after ${wallClockCapMs}ms`,
           });
         } else if (spawnError) {
           // The toolchain could not be run at all. That is an environment

@@ -4,8 +4,18 @@
 import type { ModelRole, ProviderKind } from '@lale/protocol';
 
 export const DEFAULT_OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
-export const DEFAULT_FORMALIZER_MODEL = 'openai/gpt-6-astra';
-export const DEFAULT_AUXILIARY_MODEL = 'openai/gpt-6-astra';
+// GPT-6.2 Astra and Claude Fable 5.2 lead Autoform-Hard (research-level
+// formalization) as of Nov 2026, tied on 48 of 56 tasks; Astra alone solved a
+// 49th. OpenRouter IDs follow its published naming; `getModelPricing` finds no
+// price for an unknown ID, so a wrong one shows up before the first request.
+export const ASTRA_MODEL = 'openai/gpt-6.2-astra';
+export const FABLE_MODEL = 'anthropic/claude-fable-5.2';
+export const SUPPORTED_PROVER_MODELS = [
+  { modelId: ASTRA_MODEL, label: 'GPT-6.2 Astra' },
+  { modelId: FABLE_MODEL, label: 'Claude Fable 5.2' },
+] as const;
+export const DEFAULT_FORMALIZER_MODEL = ASTRA_MODEL;
+export const DEFAULT_AUXILIARY_MODEL = ASTRA_MODEL;
 
 // All three roles run on OpenRouter, so a single stored key serves the whole app.
 export const OPENROUTER_KEY_REF = 'lale:openrouter.ai';
@@ -32,7 +42,7 @@ export interface ProviderConfigSpec {
 // The advisory role only emits short JSON verdicts and needs far less of both.
 // The proposer has its own row below, so this effort governs formalization only.
 export function defaultProviderConfigSpecs(): ProviderConfigSpec[] {
-  // Astra is the default across formalization, proving, and advisory calls.
+  // Astra 6.2 is the default across formalization, proving, and advisory calls.
   return [
     {
       role: 'formalizer',

@@ -3,6 +3,10 @@ import { isLeanDeclarationName, isLeanSimpleName } from '@lale/lean-runner';
 import { RunBudget } from './budget.js';
 export { RunBudget, BudgetExceededError } from './budget.js';
 export type { TokenPricing } from './budget.js';
+import { estimateChatBytes, fromWireChoice, toWireMessages, toWireTools } from './chat.js';
+import type { ChatMessage, ChatToolSpec, ChatTurnResult } from './chat.js';
+export { estimateChatBytes, fromWireChoice, toWireMessages, toWireTools } from './chat.js';
+export type { ChatMessage, ChatToolCall, ChatToolSpec, ChatTurnResult } from './chat.js';
 
 // ---------------------------------------------------------------------------
 // Model client config
@@ -97,6 +101,48 @@ export class ModelClient {
         + (truncated ? ' Reasoning and output exhausted the budget; the obligation may be too large to answer in one response.' : ''),
       );
     }
+  }
+
+  /**
+   * One turn of a tool-calling conversation. Unlike `complete`, a turn that
+   * ends in tool calls with no text is the normal case, and truncation is
+   * returned to the caller rather than retried: an agent loop decides for
+   * itself whether a cut-off turn is worth another request.
+   */
+  async chat(
+    messages: ChatMessage[],
+    tools: ChatToolSpec[],
+    maxTokensOverride?: number,
+  ): Promise<ChatTurnResult & { usage: TokenUsage }> {
+    const c = this.config;
+    let ceiling = maxTokensOverride ?? c.maxTokens ?? 32768;
+    if (!Number.isSafeInteger(ceiling) || ceiling <= 0) throw new Error('Invalid output token budget');
+    ceiling = Math.min(ceiling, MAX_OUTPUT_CEILING);
+    const openrouter = new URL(c.baseURL ?? 'https://api.openai.com/v1').hostname === 'openrouter.ai';
+    const inputReserved = estimateChatBytes(messages, tools);
+    const outputReserved = c.budget?.reserve(inputReserved, ceiling) ?? ceiling;
+    const body = {
+      model: c.modelId,
+      max_tokens: outputReserved,
+      ...(!c.reasoningEffort && c.temperature !== undefined ? { temperature: c.temperature } : {}),
+      // Reasoning is not excluded here, unlike `complete`: its state has to be
+      // handed back with each tool result (see `reasoningDetails`).
+      ...(c.reasoningEffort ? openrouter
+        ? { reasoning: { effort: c.reasoningEffort }, provider: { require_parameters: true } }
+        : { reasoning_effort: c.reasoningEffort } : {}),
+      messages: toWireMessages(messages),
+      ...(tools.length ? { tools: toWireTools(tools), tool_choice: 'auto' } : {}),
+    };
+    // The SDK's message types predate `reasoning_details`; the body is built
+    // and checked here, so it is passed through untyped.
+    const response = await this.client.chat.completions.create(
+      body as unknown as Parameters<OpenAI['chat']['completions']['create']>[0],
+    ) as OpenAI.Chat.Completions.ChatCompletion;
+    const usage = { inputTokens: response.usage?.prompt_tokens ?? inputReserved,
+      outputTokens: response.usage?.completion_tokens ?? outputReserved };
+    if (response.usage) c.budget?.settle(inputReserved, outputReserved, usage.inputTokens, usage.outputTokens);
+    c.onUsage?.(usage);
+    return { ...fromWireChoice(response.choices[0]), usage };
   }
 
   private async request(

@@ -108,7 +108,18 @@ without a stored mode default to `full`.
   integration remain manual checks. The obsolete `test:lean` command was removed.
 - `pnpm evals` checks three bundled fixtures. Running with `--live` uses a running
   desktop service and paid model requests, and requires `LALE_DESKTOP_TOKEN`.
-- Proof generation is generate-and-check, not proof search: one model call
+- An agentic prover (`apps/desktop/src/pipeline/agent/`) is built and tested
+  offline but not yet wired into runs. It works through typed tools (helper
+  files, Lean checks with `sorry` allowed, `exact?` probes, `#check` lookups,
+  Mathlib declaration search) for as many turns as a per-claim dollar budget
+  allows: a hard ceiling, and a floor below which a give-up is refused and the
+  agent is sent back to work. A proof is accepted only by a clean-room gate:
+  the frozen statement spliced in verbatim, no trust allowances, standard
+  axioms only, and the kernel's goal term equal to the one frozen before the
+  agent started. Defaults are $5 ceiling and $1 floor per claim.
+- Default models are GPT-6.2 Astra for every role, with Claude Fable 5.2 as the
+  supported alternative (`SUPPORTED_PROVER_MODELS`).
+- Proof generation in runs today is generate-and-check, not proof search: one model call
   writes a whole tactic block and Lean adjudicates. Lean's own tactic ladder is
   tried first, for free; past that a claim gets at most four model attempts,
   bounded separately for syntax failures and unsolved goals. There is no premise
