@@ -1,6 +1,6 @@
 // 0.4.0 widened the fingerprint hash, so every value this module produces has
 // changed; claims accepted under 0.3.0 do not match and have to be rerun.
-export const PARSER_VERSION = '0.4.0';
+export const PARSER_VERSION = '0.5.0';
 
 export type TheoremKind =
   | 'theorem'
@@ -295,16 +295,20 @@ function attachAmbientContext(source: string, claims: ParsedClaim[]): void {
     const parts: string[] = [];
 
     // Opening matter: global conventions stated before any sectioning command.
+    // In a paper with no sections that is everything before the claim, and it
+    // gets the whole budget rather than one part's share.
     const firstHeading = headings.find((heading) => heading.commandStart >= documentStart);
     const preambleEnd = Math.min(firstHeading?.commandStart ?? source.length, claim.startOffset);
-    addAmbientPart(parts, source, documentStart, preambleEnd, claimSpans);
+    const enclosing = enclosingHeadings(headings, claim.startOffset);
+    addAmbientPart(parts, source, documentStart, preambleEnd, claimSpans,
+      enclosing.length === 0 ? MAX_AMBIENT_CHARS : MAX_AMBIENT_PART_CHARS);
 
     // Lead prose of every sectioning unit enclosing the claim, outermost first.
     // Outermost matters most: "let G be a finite simple graph" is typically
     // stated once under \section, while the claim sits under a \subsection.
     // Each part opens with its own heading, so the model sees which unit the
     // hypotheses belong to.
-    for (const heading of enclosingHeadings(headings, claim.startOffset)) {
+    for (const heading of enclosing) {
       const next = headings.find((other) => other.commandStart > heading.commandStart);
       const end = Math.min(next?.commandStart ?? source.length, claim.startOffset);
       addAmbientPart(parts, source, heading.commandStart, end, claimSpans);
@@ -346,10 +350,26 @@ function addAmbientPart(
   start: number,
   end: number,
   claimSpans: ReadonlyArray<readonly [number, number]>,
+  cap: number = MAX_AMBIENT_PART_CHARS,
 ): void {
   if (end <= start) return;
   const text = cleanAmbientProse(removeSpans(source.slice(start, end), start, claimSpans));
-  if (text) parts.push(text.slice(0, MAX_AMBIENT_PART_CHARS));
+  if (text) parts.push(truncateKeepingEnd(text, cap));
+}
+
+/**
+ * The prose nearest a claim is usually where its notation was just defined
+ * ("Let K(X) be the field of rational functions ..."), so an over-long part
+ * keeps a short head, for global conventions, and the rest from the end.
+ * Keeping only the head — as this once did — let a paper's front matter use
+ * up the budget and drop the definitions the claim is stated in.
+ */
+function truncateKeepingEnd(text: string, cap: number): string {
+  if (text.length <= cap) return text;
+  const marker = '\n[…]\n';
+  const head = Math.floor((cap - marker.length) / 4);
+  const tail = cap - marker.length - head;
+  return text.slice(0, head) + marker + text.slice(text.length - tail);
 }
 
 /** Drops claim and proof environments that fall inside `[offset, offset + text.length)`. */
@@ -370,8 +390,15 @@ function removeSpans(
   return result + text.slice(cursor);
 }
 
+// Layout and front-matter commands carry no mathematics. Removed before the
+// length cap is applied, so they cannot crowd out the prose that does.
+const FRONT_MATTER_GROUPS = /\\(?:footnotetext|thanks|renewcommand\{[^}]*\}|date|keywords|subjclass|dedicatory)\{(?:[^{}]|\{[^{}]*\})*\}/g;
+const LAYOUT_COMMANDS = /\\(?:maketitle|tableofcontents|noindent|medskip|smallskip|bigskip|newpage|clearpage|begingroup|endgroup|vspace\*?\{[^}]*\}|hspace\*?\{[^}]*\})/g;
+
 function cleanAmbientProse(source: string): string {
   return maskLatexComments(source)
+    .replace(FRONT_MATTER_GROUPS, '')
+    .replace(LAYOUT_COMMANDS, '')
     .replace(/\\label\{[^}]+\}/g, '')
     .replace(/[ \t]+/g, ' ')
     .replace(/\n{3,}/g, '\n\n')

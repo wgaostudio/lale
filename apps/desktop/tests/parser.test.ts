@@ -36,3 +36,19 @@ test('comments do not change a claim fingerprint', () => {
   const after = parseLatexDocument(document.replace('positive integer.', 'positive integer. % explanation'));
   assert.equal(before.claims[0]!.fingerprint, after.claims[0]!.fingerprint);
 });
+
+test('in an unsectioned paper, definitions just before a claim survive long front matter', () => {
+  const frontMatter = Array.from({ length: 200 }, (_, i) => `Front matter line ${i} about the history of the problem.`).join('\n');
+  const paper = String.raw`\begin{document}
+\maketitle
+\begingroup\renewcommand{\thefootnote}{}\footnotetext{MSC 16D90.}\endgroup
+\noindent ${frontMatter}
+Let $K(X)$ be the field of rational functions in indeterminates $x_{i,j}$.
+\begin{lemma}\label{lem:one} The elements $c_i$ are independent over $K(X)$.\end{lemma}
+\end{document}`;
+  const ambient = parseLatexDocument(paper).claims[0]!.ambientContext;
+  assert.match(ambient, /Let \$K\(X\)\$ be the field of rational functions/, 'the nearest definition is kept');
+  assert.match(ambient, /Front matter line 0 /, 'the opening is kept too');
+  assert.match(ambient, /\[…\]/, 'and the cut is marked');
+  assert.doesNotMatch(ambient, /maketitle|footnotetext|noindent|begingroup/, 'layout commands are dropped');
+});

@@ -99,6 +99,12 @@ the account cannot cover a single worst-case request.
 
 ## Validation and known gaps
 
+Parser 0.5.0 keeps the definitions nearest a claim when its surrounding
+context is too long, and drops layout commands first: in a paper without
+sections, front matter used to fill the budget and cut off the notation the
+claim was stated in. Context feeds fingerprints, so claims accepted under 0.4.0
+need rerunning before reuse.
+
 Parser 0.4.0 widened the fingerprint hash from 32 to 128 bits — it decides
 cache reuse and staleness, and 8 hex digits was a thin margin. Every stored
 fingerprint therefore changed, so claims accepted under 0.3.0 need rerunning
