@@ -13,3 +13,6 @@ tests/.runner-*/
 tests/.service-*/
 tests/lean/.lake/
 tests/lean/Checks/
+
+# Research test copies are derived from copyrighted papers; keep them local.
+evals/research/**/local/

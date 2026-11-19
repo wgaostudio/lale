@@ -10,7 +10,8 @@
     "dev": "tsx src/dev.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "evals": "tsx src/evals.ts",
-    "test": "tsx --test tests/*.test.ts"
+    "test": "tsx --test tests/*.test.ts",
+    "research": "tsx src/research.ts"
   },
   "dependencies": {
     "@lale/cache": "workspace:*",

@@ -14,7 +14,8 @@
     "typecheck": "pnpm -r typecheck",
     "desktop:dev": "pnpm --filter @lale/desktop dev",
     "evals": "pnpm --filter @lale/desktop evals",
-    "test": "pnpm --filter @lale/desktop test"
+    "test": "pnpm --filter @lale/desktop test",
+    "research": "pnpm --filter @lale/desktop research"
   },
   "devDependencies": {
     "@types/node": "^25.6.2",
