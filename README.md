@@ -136,8 +136,13 @@ without a stored mode default to `full`.
   (a false premise would make every step after it vacuous); one Mathlib can
   prove is discharged. A subtly false or overstated citation can still slip
   through, which is why `verifiedGivenCitations` lists them for the author to
-  review. Claims citing a `verifiedGivenCitations` claim do not treat it as
-  verified.
+  review.
+- A claim that cites a `verifiedGivenCitations` claim inherits its assumptions:
+  in Check proof steps they become premises of every step and of the result,
+  so the citing claim is at best `verifiedGivenCitations` too, and the side
+  panel lists them as inherited. This is conservative — every step gets them,
+  not only the steps that use the cited claim. Verify cannot use such a claim
+  and reports `dependencyMissing`.
 - Default models are GPT-6.2 Astra for every role, with Claude Fable 5.2 as the
   supported alternative (`SUPPORTED_PROVER_MODELS`).
 - Proof generation in runs today is generate-and-check, not proof search: one model call

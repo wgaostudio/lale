@@ -36,6 +36,20 @@ export interface AuditGraph {
 // Normalized claim context (§3.6)
 // ---------------------------------------------------------------------------
 
+/**
+ * A cited result a dependency was proved *given*. A claim that cites a
+ * `verifiedGivenCitations` claim inherits these: its own result can be no
+ * stronger than the results it builds on.
+ */
+export interface InheritedAssumption {
+  /** The `Prop` definition, declared in the dependency chain's accepted sources. */
+  leanName: string;
+  name: string;
+  statement: string;
+  /** Label of the claim the assumption came through. */
+  from: string;
+}
+
 export interface ResolvedDependency {
   fingerprint: string;
   label: string;
@@ -43,6 +57,8 @@ export interface ResolvedDependency {
   statementText: string;
   leanDeclaration: string | null;
   verified: boolean;
+  /** Present when the dependency holds only given these cited results. */
+  assumes?: InheritedAssumption[];
 }
 
 export interface NormalizedClaimContext {

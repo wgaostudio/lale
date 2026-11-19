@@ -209,6 +209,8 @@ export const ArgumentCitation = z.object({
   reason: z.string(),
   leanSource: z.string().nullable(),
   backtranslation: z.string().nullable(),
+  /** Label of the cited claim this assumption was inherited through, if not the author's own citation here. */
+  inheritedFrom: z.string().nullable().default(null),
 });
 export type ArgumentCitation = z.infer<typeof ArgumentCitation>;
 

@@ -64,7 +64,7 @@ test('composition and citation expectations', () => {
 
   const assumed = judgeEvalCase(byId('steps-citation-assumed'), result('verifiedGivenCitations', {
     steps: [step(1, 'apply', true)],
-    citations: [{ idx: 1, name: 'Oliveira e Silva, Herzog and Pardi', statement: 'Goldbach to 4e18', status: 'discharged', reason: '', leanSource: null, backtranslation: null }],
+    citations: [{ idx: 1, name: 'Oliveira e Silva, Herzog and Pardi', statement: 'Goldbach to 4e18', status: 'discharged', reason: '', leanSource: null, backtranslation: null, inheritedFrom: null }],
     composition: composition('proved'), agentSpendUsd: 0, proverModel: null, budget: null,
   }));
   assert.match(assumed.failures.join(), /was discharged, expected assumed/);

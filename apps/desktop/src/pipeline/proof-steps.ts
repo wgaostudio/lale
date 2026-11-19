@@ -109,6 +109,8 @@ export interface CitationResult {
   status: CitationStatus;
   reason: string;
   backtranslation: string | null;
+  /** Set for an assumption inherited from a cited claim rather than cited here. */
+  inheritedFrom?: string;
 }
 
 export interface CompositionResult {
@@ -324,6 +326,29 @@ export async function checkProofSkeleton(
       citation: citation.idx, status: citation.status,
     });
   }
+  // Assumptions inherited from cited claims proved only given their own
+  // citations. Their definitions are already in the dependency sources; they
+  // become premises of every step and of the composition, because which step
+  // leans on the cited claim is not known.
+  const seenInherited = new Set<string>();
+  for (const dependency of context.resolvedDependencies) {
+    for (const assumption of dependency.assumes ?? []) {
+      if (seenInherited.has(assumption.leanName)) continue;
+      seenInherited.add(assumption.leanName);
+      citations.push({
+        idx: citations.length + 1, name: assumption.name, statement: assumption.statement, sourceText: '',
+        leanName: assumption.leanName, leanSource: null, status: 'assumed',
+        reason: `Assumed by ${assumption.from}, which this proof cites`, backtranslation: null, inheritedFrom: assumption.from,
+      });
+    }
+  }
+  const inherited = citations.filter((c) => c.inheritedFrom !== undefined);
+  if (inherited.length) {
+    options.onProgress?.(`Inherits ${inherited.length} assumption${inherited.length === 1 ? '' : 's'} from cited claims`, {
+      inherited: inherited.map((c) => c.leanName),
+    });
+  }
+
   // Rejected and unstated citations contribute nothing a step could use.
   const citationPrelude = citations
     .filter((c) => (c.status === 'assumed' || c.status === 'discharged') && c.leanSource)
@@ -342,7 +367,8 @@ export async function checkProofSkeleton(
   const provedFacts: NamedFact[] = [];
 
   for (const [index, spec] of segmented.steps.entries()) {
-    const cited = spec.cites.map((i) => citations[i - 1]).filter((c): c is CitationResult => c !== undefined);
+    const own = spec.cites.map((i) => citations[i - 1]).filter((c): c is CitationResult => c !== undefined && c.inheritedFrom === undefined);
+    const cited = [...own, ...inherited];
     const unusable = cited.filter((c) => c.status === 'rejected' || c.status === 'unstated');
     const premises = cited.filter((c) => c.status === 'assumed').map((c) => c.leanName);
 

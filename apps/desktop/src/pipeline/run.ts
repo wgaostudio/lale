@@ -31,6 +31,7 @@ import { runProposer, type ProposerResult } from './proposer.js';
 import { ACCEPTABLE_FAITHFULNESS, runFinalGate } from './gate.js';
 import { AGENT_BUDGET_PRESETS, checkProofSkeleton } from './proof-steps.js';
 import type { AgentEvent } from './agent/prover.js';
+import type { InheritedAssumption } from './context.js';
 import { mathlibSourceRoot } from './agent/mathlib-search.js';
 import { validateCachedProof } from './cache-proof.js';
 import { extractLeanImports, getMathlibImportIndex } from './mathlib-index.js';
@@ -784,6 +785,20 @@ async function executePipeline(
       return;
     }
 
+    // A claim proved only given cited results cannot support an unconditional
+    // proof. Check proof steps carries the assumptions forward; Verify cannot.
+    const conditionalDependencies = context.resolvedDependencies.filter((d) => d.assumes?.length);
+    if (conditionalDependencies.length > 0 && input.mode === 'full') {
+      emit(
+        'selectContext',
+        'warning',
+        `Cites claims proved only given cited results (${conditionalDependencies.map((d) => d.label).join(', ')}). `
+        + 'Use Check proof steps, which carries those assumptions into this claim.',
+      );
+      finish('dependencyMissing', 'selectContext');
+      return;
+    }
+
     // ── Cost preflight ───────────────────────────────────────────────────
     // Priced before the first request, so an underfunded account is told now
     // rather than after three quarters of a run has been paid for.
@@ -1204,11 +1219,15 @@ async function executePipeline(
          VALUES (?, ?, ?, ?, ?)`,
       ).run(
         auditRunId,
-        JSON.stringify(skeleton.citations.map(({ idx, name, statement, status, reason, leanSource, backtranslation }) =>
-          ({ idx, name, statement, status, reason, leanSource, backtranslation }))),
+        JSON.stringify(skeleton.citations.map(({ idx, name, statement, status, reason, leanSource, backtranslation, leanName, inheritedFrom }) =>
+          ({ idx, name, statement, status, reason, leanSource, backtranslation, leanName, inheritedFrom: inheritedFrom ?? null }))),
         JSON.stringify({
           status: skeleton.composition.status,
           conditionalOn: skeleton.composition.conditionalOn,
+          // What a claim citing this one inherits, if it passes conditionally.
+          assumptions: skeleton.citations
+            .filter((c) => skeleton.composition.conditionalOn.includes(c.leanName))
+            .map((c) => ({ leanName: c.leanName, name: c.name, statement: c.statement, ...(c.inheritedFrom ? { from: c.inheritedFrom } : {}) })),
           closedBy: skeleton.composition.closedBy,
           report: skeleton.composition.report,
           diagnostics: skeleton.composition.diagnostics,
@@ -1727,49 +1746,77 @@ function hydrateDependencyDeclarations(
   return {
     ...context,
     resolvedDependencies: context.resolvedDependencies.map((dependency) => {
-      const leanDeclaration = latestAcceptedLeanDeclaration(db, projectId, dependency.label, dependency.fingerprint);
-      return leanDeclaration
-        ? { ...dependency, leanDeclaration, verified: true }
+      const accepted = latestAcceptedLeanDeclaration(db, projectId, dependency.label, dependency.fingerprint);
+      return accepted
+        ? { ...dependency, leanDeclaration: accepted.source, verified: true,
+            ...(accepted.assumes.length ? { assumes: accepted.assumes } : {}) }
         : dependency;
     }),
   };
 }
 
-function latestAcceptedLeanDeclaration(
+export function latestAcceptedLeanDeclaration(
   db: Database,
   projectId: string,
   label: string,
   fingerprint: string,
-): string | null {
+): { source: string; assumes: InheritedAssumption[] } | null {
   const row = db
     .prepare(
-      `SELECT fh.artifactsJson, fpa.leanSource AS provenSource
+      `SELECT fh.artifactsJson, fpa.leanSource AS provenSource, ar.outcome, pa.compositionJson
        FROM frozen_headers fh
        JOIN audit_runs ar ON ar.auditRunId = fh.auditRunId
        LEFT JOIN final_proof_artifacts fpa ON fpa.auditRunId = ar.auditRunId AND fpa.acceptedByLean = 1
+       LEFT JOIN proof_arguments pa ON pa.auditRunId = ar.auditRunId
        JOIN claim_revisions cr ON cr.claimRevisionId = ar.targetClaimRevisionId
        JOIN claim_identities ci ON ci.claimIdentityId = cr.claimIdentityId
        WHERE ci.projectId = ?
          AND cr.label = ?
          AND cr.claimFingerprint = ?
-         AND ci.statusCache IN ('verified', 'formalized')
+         AND ci.statusCache IN ('verified', 'verifiedGivenCitations', 'formalized')
          AND ar.status = 'finished'
-         AND ar.outcome IN ('verified', 'formalized')
+         AND ar.outcome IN ('verified', 'verifiedGivenCitations', 'formalized')
        ORDER BY ar.finishedAt DESC
        LIMIT 1`,
     )
-    .get(projectId, label, fingerprint) as { artifactsJson: string; provenSource: string | null } | undefined;
+    .get(projectId, label, fingerprint) as {
+      artifactsJson: string; provenSource: string | null; outcome: string; compositionJson: string | null;
+    } | undefined;
 
   if (!row) return null;
 
-  if (row.provenSource) return row.provenSource;
+  if (row.provenSource) {
+    if (row.outcome !== 'verifiedGivenCitations') return { source: row.provenSource, assumes: [] };
+    // A conditional proof is usable only with its assumptions attached. If
+    // they cannot be read back, it is not usable at all.
+    const assumes = readStoredAssumptions(row.compositionJson, label);
+    return assumes ? { source: row.provenSource, assumes } : null;
+  }
   try {
     const artifacts = JSON.parse(row.artifactsJson) as { artifactKind?: unknown; leanSource?: unknown };
     // A formalized theorem still contains sorry. Only accepted definitions can
     // be reused without a kernel-accepted proof artifact.
     return artifacts.artifactKind === 'definition' && typeof artifacts.leanSource === 'string' && artifacts.leanSource.trim()
-      ? artifacts.leanSource
+      ? { source: artifacts.leanSource, assumes: [] }
       : null;
+  } catch {
+    return null;
+  }
+}
+
+function readStoredAssumptions(compositionJson: string | null, label: string): InheritedAssumption[] | null {
+  try {
+    const parsed = JSON.parse(compositionJson ?? '') as { assumptions?: unknown };
+    if (!Array.isArray(parsed.assumptions) || parsed.assumptions.length === 0) return null;
+    const assumes: InheritedAssumption[] = [];
+    for (const entry of parsed.assumptions as Array<Record<string, unknown>>) {
+      const { leanName, name, statement } = entry;
+      if (typeof leanName !== 'string' || typeof name !== 'string' || typeof statement !== 'string') return null;
+      // An assumption inherited from further down keeps the label it came
+      // through; one the dependency cited itself is attributed to it.
+      assumes.push({ leanName, name, statement, from: typeof entry['from'] === 'string' ? entry['from'] : label });
+    }
+    return assumes;
   } catch {
     return null;
   }

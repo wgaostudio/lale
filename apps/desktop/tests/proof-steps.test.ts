@@ -270,3 +270,30 @@ test('withPremises and containsObligation', () => {
   assert.ok(!containsObligation(frozen, 'def t : Nat := 0\ntheorem t : True := by\n  trivial', 't'), 'a second declaration of the name fails');
   assert.ok(containsObligation(frozen, '-- theorem t : x\ntheorem t : True := by\n  trivial', 't'), 'comments do not count');
 });
+
+test('assumptions inherited from a cited claim become premises of every step and of the result', async () => {
+  const scenario: Scenario = {
+    steps: [{ claim: 'first fact' }, { claim: 'the conclusion' }],
+    ladderCloses: new Set(['target_givenCitations']),
+    agent: { step: 'prove' },
+  };
+  const { runner: r } = fakeRunner(scenario);
+  const { client, agentClient } = fakeClients(scenario);
+  const context: NormalizedClaimContext = {
+    ...CONTEXT,
+    resolvedDependencies: [{
+      fingerprint: 'f', label: 'thm:three', kind: 'claim', statementText: 'Theorem 3', verified: true,
+      leanDeclaration: 'def laleCite_three_1 : Prop := True\ntheorem three_givenCitations : laleCite_three_1 → Q := by exact x',
+      assumes: [{ leanName: 'laleCite_three_1', name: 'Bergman', statement: 'no GK dim in (1,2)', from: 'thm:three' }],
+    }],
+  };
+  const result = await checkProofSkeleton(client, client, client, r, FROZEN, context, 'test', 'test', {
+    agent: { client: agentClient, pricing: { prompt: 1e-6, completion: 4e-6 }, mathlibRoot: null },
+  });
+  assert.equal(result.citations.length, 1);
+  assert.equal(result.citations[0]!.inheritedFrom, 'thm:three');
+  assert.equal(result.citationPrelude, '', 'the definition lives in the dependency, not here');
+  for (const s of result.steps) assert.match(s.leanSource!, /: laleCite_three_1 → \(/);
+  assert.equal(result.composition.status, 'proved');
+  assert.deepEqual(result.composition.conditionalOn, ['laleCite_three_1']);
+});
