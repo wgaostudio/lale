@@ -16,6 +16,7 @@ import { LeanRunner, fillObligation, parseObligation } from '@lale/lean-runner';
 import { tryTacticLadder } from './tactics.js';
 import { composeLeanFile } from './formalize.js';
 import { formatDependencyDeclarations, type NormalizedClaimContext } from './context.js';
+import type { ProverBudgetPreset } from '@lale/protocol';
 import {
   DEFAULT_COMPOSITION_MAX_LINES,
   runAgentProver,
@@ -154,6 +155,23 @@ export interface ProofSkeletonAgentConfig {
 export const DEFAULT_STEP_BUDGET: AgentBudget = { ceilingUsd: 2, floorUsd: 0.25 };
 export const DEFAULT_COMPOSITION_BUDGET: AgentBudget = { ceilingUsd: 0.5, floorUsd: 0 };
 export const DEFAULT_CITATION_BUDGET: AgentBudget = { ceilingUsd: 0.3, floorUsd: 0 };
+
+/**
+ * Per-run presets. Uncalibrated starting points: `hard` is sized from one
+ * public data point, a research theorem proved by an agent for about $22 in 94
+ * minutes, spread over the handful of steps a paper's proof usually has.
+ */
+export const AGENT_BUDGET_PRESETS: Record<ProverBudgetPreset, {
+  step: AgentBudget; composition: AgentBudget; citation: AgentBudget; maxTurnsPerStep: number;
+}> = {
+  standard: { step: DEFAULT_STEP_BUDGET, composition: DEFAULT_COMPOSITION_BUDGET, citation: DEFAULT_CITATION_BUDGET, maxTurnsPerStep: 150 },
+  hard: {
+    step: { ceilingUsd: 25, floorUsd: 5 },
+    composition: { ceilingUsd: 3, floorUsd: 0 },
+    citation: { ceilingUsd: 2, floorUsd: 0 },
+    maxTurnsPerStep: 400,
+  },
+};
 
 export interface ProofSkeletonOptions {
   onProgress?: (message: string, payload?: Record<string, unknown>) => void;

@@ -432,3 +432,19 @@ button.plan-row:hover {
   font-family: var(--lale-font-mono);
   font-size: var(--lale-text-xs);
 }
+
+/* Check proof steps: the author's argument */
+.argument-summary { margin-bottom: var(--lale-space-4); }
+.argument-steps { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--lale-space-5); }
+.argument-step { display: flex; flex-direction: column; gap: var(--lale-space-2); }
+.argument-step-head { display: flex; flex-wrap: wrap; align-items: center; gap: var(--lale-space-2) var(--lale-space-3); }
+.argument-index { color: var(--lale-ink-faint); font-size: var(--lale-text-xs); min-width: 1.5em; }
+.argument-step .callout { margin: var(--lale-space-2) 0 0; }
+.argument-step .callout p { margin: var(--lale-space-1) 0 0; white-space: pre-wrap; }
+.argument-diagnostic { font-size: var(--lale-text-sm); }
+.argument-details summary { cursor: pointer; color: var(--lale-ink-muted); font-size: var(--lale-text-sm); }
+.argument-details .lean-source { margin: var(--lale-space-2) 0 0; font-family: var(--lale-font-mono); font-size: var(--lale-text-xs); white-space: pre-wrap; overflow-wrap: anywhere; }
+.argument-label { display: block; margin: var(--lale-space-5) 0 var(--lale-space-2); }
+.argument-citations { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: var(--lale-space-4); }
+.setting-row { display: flex; flex-direction: column; gap: var(--lale-space-1); margin-bottom: var(--lale-space-4); }
+.argument-citation-name { font-weight: var(--lale-weight-medium); }

@@ -1,3 +1,4 @@
+import { readProofArgument } from './argument.js';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { join } from 'node:path';
@@ -546,6 +547,7 @@ async function handleVerify(req: IncomingMessage, res: ServerResponse): Promise<
     parserVersion,
     leanProjectDir,
     mode: body.data.mode,
+    ...(body.data.prover ? { prover: body.data.prover } : {}),
   }, {
     leanVersion,
     mathlibRevision,
@@ -682,6 +684,7 @@ function handleGetRun(res: ServerResponse, runId: string): void {
     leanSource: artifactRow?.leanSource ?? null,
     diagnostics: (db.prepare("SELECT message FROM run_events WHERE auditRunId = ? AND level IN ('warning', 'error') ORDER BY rowid").all(runId) as Array<{ message: string }>).map(row => row.message),
     durationMs: run.durationMs ?? null,
+    argument: readProofArgument(db, runId),
   } satisfies RunResult);
 }
 

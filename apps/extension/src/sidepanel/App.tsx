@@ -83,6 +83,9 @@ export function App() {
           // and short-circuit without a force flag.
           void sendMessage({ type: 'sidepanel.startProvision', force: true }).then(loadState);
         }}
+        onSetProverPreferences={(preferences) => {
+          void sendMessage({ type: 'sidepanel.setProverPreferences', preferences }).then(loadState);
+        }}
       />
     );
   }

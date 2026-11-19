@@ -1,5 +1,6 @@
 import {
   readSse,
+  ProverOptions,
   RunResult,
   AcceptedRunResponse,
   CreateProjectRequest,
@@ -32,6 +33,7 @@ const DESKTOP_URL = 'http://127.0.0.1:8765';
 const STATE_STORAGE_KEY = 'lale.extensionState';
 
 const BEARER_TOKEN_STORAGE_KEY = 'lale.bearerToken';
+const PROVER_PREFERENCES_STORAGE_KEY = 'lale.proverPreferences';
 const MAX_PROVISION_EVENTS = 80;
 const MAX_RUN_EVENTS = 120;
 
@@ -75,6 +77,8 @@ let state: ExtensionState = {
   hasOpenRouterKey: false,
   provision: null,
   provisionEvents: [],
+  proverPreferences: { budget: 'standard' },
+  latestArgument: null,
   error: null,
   updatedAt: new Date().toISOString(),
 };
@@ -170,6 +174,12 @@ async function handleSidepanelMessage(
     case 'sidepanel.setOpenRouterKey':
       await setOpenRouterKey(message.key);
       return state;
+    case 'sidepanel.setProverPreferences': {
+      const preferences = ProverOptions.parse(message.preferences);
+      await chrome.storage.local.set({ [PROVER_PREFERENCES_STORAGE_KEY]: preferences }).catch(() => undefined);
+      await setState({ proverPreferences: preferences });
+      return state;
+    }
     case 'sidepanel.clearOpenRouterKey':
       await clearOpenRouterKey();
       return state;
@@ -338,6 +348,8 @@ async function verifyClaim(claimId: string, mode: VerificationMode = 'full'): Pr
     parsedDocumentFingerprint: state.parsedDocument.fingerprint,
     parserVersion: PARSER_VERSION,
     mode,
+    // Only Check proof steps runs the agent prover; other modes ignore it.
+    ...(mode === 'proofSkeleton' ? { prover: state.proverPreferences } : {}),
   };
 
   const response = await fetch(`${DESKTOP_URL}/v1/verify`, {
@@ -401,6 +413,7 @@ function subscribeToRunEvents(runId: string, claimId: string, token: string | nu
   updateRunKeepalive();
   const capturedFingerprint = state.parsedDocument?.claims.find(c => c.id === claimId)?.fingerprint;
   const complete = async (outcome: string | undefined): Promise<void> => {
+    await refreshArgument(runId, claimId, token);
     await setState({
       ...(state.activeRunId === runId ? { activeRunId: null } : {}),
       claimStates: updateClaimRuntime(state.claimStates, claimId, {
@@ -452,9 +465,19 @@ function subscribeToRunEvents(runId: string, claimId: string, token: string | nu
   })();
 }
 
+/** Reads the step-by-step result of a finished run, when it has one. */
+async function refreshArgument(runId: string, claimId: string, token: string | null): Promise<void> {
+  const response = await fetch(`${DESKTOP_URL}/v1/runs/${runId}`, { headers: authHeaders(token) }).catch(() => null);
+  if (!response?.ok) return;
+  const result = RunResult.safeParse(await response.json().catch(() => null));
+  if (!result.success || !result.data.argument) return;
+  await setState({ latestArgument: { runId, claimId, argument: result.data.argument } });
+}
+
 function outcomeToClaimStatus(outcome: string | undefined): ExtensionClaimStatus {
   if (outcome === 'formalized') return 'formalized';
   if (outcome === 'verified') return 'verified';
+  if (outcome === 'verifiedGivenCitations') return 'verifiedGivenCitations';
   if (outcome === 'dependencyMissing' || outcome === 'verificationBlocked') return 'blocked';
   if (outcome === undefined) return 'pending';
   return 'failed';
@@ -513,7 +536,11 @@ async function setState(patch: Partial<ExtensionState>): Promise<void> {
 async function restoreState(): Promise<void> {
   const stored = await chrome.storage.session.get(STATE_STORAGE_KEY).catch(() => ({}));
   const restored = (stored as Record<string, unknown>)[STATE_STORAGE_KEY] as ExtensionState | undefined;
-  if (restored) state = restored;
+  // Fields added after a session's state was stored come from the defaults.
+  if (restored) state = { ...state, ...restored };
+  const prefs = await chrome.storage.local.get(PROVER_PREFERENCES_STORAGE_KEY).catch(() => ({}));
+  const parsedPrefs = ProverOptions.safeParse((prefs as Record<string, unknown>)[PROVER_PREFERENCES_STORAGE_KEY]);
+  if (parsedPrefs.success) state = { ...state, proverPreferences: parsedPrefs.data };
   const token = await getBearerToken();
   for (const claim of state.claimStates) {
     if (claim.status === 'checking' && claim.runId) subscribeToRunEvents(claim.runId, claim.claimId, token);

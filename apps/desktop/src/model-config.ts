@@ -1,19 +1,19 @@
 // The role and provider vocabularies are the protocol's, and the database's
 // CHECK constraints are written from the same two lists. A local copy of either
 // union typechecks against them right up until one of the three gains a member.
-import type { ModelRole, ProviderKind } from '@lale/protocol';
+import type { ModelRole, ProverModel, ProviderKind } from '@lale/protocol';
 
 export const DEFAULT_OPENROUTER_BASE_URL = 'https://openrouter.ai/api/v1';
 // GPT-6.2 Astra and Claude Fable 5.2 lead Autoform-Hard (research-level
 // formalization) as of Nov 2026, tied on 48 of 56 tasks; Astra alone solved a
 // 49th. OpenRouter IDs follow its published naming; `getModelPricing` finds no
 // price for an unknown ID, so a wrong one shows up before the first request.
-export const ASTRA_MODEL = 'openai/gpt-6.2-astra';
-export const FABLE_MODEL = 'anthropic/claude-fable-5.2';
-export const SUPPORTED_PROVER_MODELS = [
+export const ASTRA_MODEL: ProverModel = 'openai/gpt-6.2-astra';
+export const FABLE_MODEL: ProverModel = 'anthropic/claude-fable-5.2';
+export const SUPPORTED_PROVER_MODELS: ReadonlyArray<{ modelId: ProverModel; label: string }> = [
   { modelId: ASTRA_MODEL, label: 'GPT-6.2 Astra' },
   { modelId: FABLE_MODEL, label: 'Claude Fable 5.2' },
-] as const;
+];
 export const DEFAULT_FORMALIZER_MODEL = ASTRA_MODEL;
 export const DEFAULT_AUXILIARY_MODEL = ASTRA_MODEL;
 

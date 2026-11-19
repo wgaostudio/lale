@@ -29,12 +29,12 @@ import {
 import { checkDefinitionFaithfulness, checkFaithfulness } from './faithfulness.js';
 import { runProposer, type ProposerResult } from './proposer.js';
 import { ACCEPTABLE_FAITHFULNESS, runFinalGate } from './gate.js';
-import { checkProofSkeleton } from './proof-steps.js';
+import { AGENT_BUDGET_PRESETS, checkProofSkeleton } from './proof-steps.js';
 import type { AgentEvent } from './agent/prover.js';
 import { mathlibSourceRoot } from './agent/mathlib-search.js';
 import { validateCachedProof } from './cache-proof.js';
 import { extractLeanImports, getMathlibImportIndex } from './mathlib-index.js';
-import type { VerificationMode } from '@lale/protocol';
+import { ProverOptions, type VerificationMode } from '@lale/protocol';
 import { getAccountBalance, getModelPricing, formatUsd } from '../pricing.js';
 import { withHeartbeat } from './heartbeat.js';
 import { sha256 } from './hash.js';
@@ -302,12 +302,16 @@ async function buildModelClient(
   budget: RunBudget,
   emit: EventEmitter,
   auditRunId: string,
+  modelOverride?: string,
 ): Promise<ModelClient> {
-  const row = db
+  const stored = db
     .prepare('SELECT * FROM model_provider_configs WHERE providerConfigId = ?')
     .get(configId) as ProviderConfigRow | undefined;
 
-  if (!row) throw new Error(`Provider config not found: ${configId}`);
+  if (!stored) throw new Error(`Provider config not found: ${configId}`);
+  // Same provider, key and effort; only the model differs. Every supported
+  // prover model is on OpenRouter, so the stored key serves it.
+  const row: ProviderConfigRow = modelOverride ? { ...stored, modelId: modelOverride } : stored;
 
   const apiKey = await resolveApiKey(row);
 
@@ -539,6 +543,7 @@ export interface PipelineInput {
   parserVersion: string;
   leanProjectDir: string;
   mode?: VerificationMode;
+  prover?: ProverOptions;
 }
 
 /** Per-run caps, used both to start a run and to rehydrate a paused one. */
@@ -593,14 +598,15 @@ export async function runPipeline(
 
   db.prepare(
     `INSERT INTO audit_runs
-       (auditRunId, projectId, requestId, mode, status, phase, startedAt,
+       (auditRunId, projectId, requestId, mode, proverOptionsJson, status, phase, startedAt,
         leanVersion, mathlibRevision, proposerConfigId, formalizerConfigId, auxiliaryConfigId)
-     VALUES (?, ?, ?, ?, 'queued', 'parseSnapshot', ?, ?, ?, ?, ?, ?)`,
+     VALUES (?, ?, ?, ?, ?, 'queued', 'parseSnapshot', ?, ?, ?, ?, ?, ?)`,
   ).run(
     auditRunId,
     input.projectId,
     input.requestId,
     input.mode ?? 'full',
+    input.prover ? JSON.stringify(input.prover) : null,
     startedAt,
     config.leanVersion,
     config.mathlibRevision,
@@ -1124,11 +1130,24 @@ async function executePipeline(
       // Its client has its own ledger: an agent re-sends its whole history
       // each turn, which the run's token cap was never sized for. The agent's
       // dollar ceilings are what bound its spend.
-      const agentConfig = budget.pricing
+      const proposerRow = db
+        .prepare('SELECT * FROM model_provider_configs WHERE providerConfigId = ?')
+        .get(config.proposerConfigId) as ProviderConfigRow | undefined;
+      const proverModel = input.prover?.model ?? proposerRow?.modelId ?? null;
+      const preset = AGENT_BUDGET_PRESETS[input.prover?.budget ?? 'standard'];
+      const proverPricing = proverModel && proposerRow
+        ? (proverModel === proposerRow.modelId ? budget.pricing : null)
+          ?? await getModelPricing(proposerRow.baseUrl, proverModel)
+        : null;
+      const agentConfig = proverPricing && proverModel
         ? {
             client: await buildModelClient(db, config.proposerConfigId,
-              new RunBudget(AGENT_LEDGER_TOKEN_CAP, 0, 0, AGENT_LEDGER_MAX_CALLS), emit, auditRunId),
-            pricing: budget.pricing,
+              new RunBudget(AGENT_LEDGER_TOKEN_CAP, 0, 0, AGENT_LEDGER_MAX_CALLS), emit, auditRunId, proverModel),
+            pricing: proverPricing,
+            stepBudget: preset.step,
+            compositionBudget: preset.composition,
+            citationBudget: preset.citation,
+            maxTurnsPerStep: preset.maxTurnsPerStep,
             mathlibRoot: mathlibSourceRoot(input.leanProjectDir),
             onEvent: (scope: string, event: AgentEvent) => {
               if (event.type === 'turn' && event.turn % AGENT_TURN_EVENT_EVERY !== 0) return;
@@ -1137,6 +1156,10 @@ async function executePipeline(
             },
           }
         : undefined;
+      if (agentConfig) {
+        emit('proofSteps', 'info',
+          `Prover: ${proverModel}, ${input.prover?.budget ?? 'standard'} budget (up to ${formatUsd(preset.step.ceilingUsd)} a step)`);
+      }
       if (!agentConfig) emit('proofSteps', 'info', 'Model prices unavailable; steps get the one-shot prover');
 
       const skeleton = await withHeartbeat(
@@ -1175,6 +1198,26 @@ async function executePipeline(
             leanSource: citation.leanSource, backtranslation: citation.backtranslation },
         );
       }
+
+      db.prepare(
+        `INSERT OR REPLACE INTO proof_arguments (auditRunId, citationsJson, compositionJson, agentSpendUsd, createdAt)
+         VALUES (?, ?, ?, ?, ?)`,
+      ).run(
+        auditRunId,
+        JSON.stringify(skeleton.citations.map(({ idx, name, statement, status, reason, leanSource, backtranslation }) =>
+          ({ idx, name, statement, status, reason, leanSource, backtranslation }))),
+        JSON.stringify({
+          status: skeleton.composition.status,
+          conditionalOn: skeleton.composition.conditionalOn,
+          closedBy: skeleton.composition.closedBy,
+          report: skeleton.composition.report,
+          diagnostics: skeleton.composition.diagnostics,
+          proverModel: agentConfig ? proverModel : null,
+          budget: agentConfig ? (input.prover?.budget ?? 'standard') : null,
+        }),
+        skeleton.agentSpendUsd,
+        new Date().toISOString(),
+      );
 
       for (const step of skeleton.steps) {
         db.prepare(
@@ -1580,6 +1623,7 @@ function rehydratePipelineRun(
       parserVersion: snapshot.parserVersion,
       leanProjectDir,
       mode: run.mode,
+      ...(parseStoredProverOptions(run.proverOptionsJson) ? { prover: parseStoredProverOptions(run.proverOptionsJson)! } : {}),
     },
     config: {
       leanVersion: run.leanVersion,
@@ -1591,6 +1635,11 @@ function rehydratePipelineRun(
       wallClockCapMs: runtimeSettings.wallClockCapMs,
     },
   };
+}
+
+function parseStoredProverOptions(json: string | null): ProverOptions | null {
+  if (!json) return null;
+  try { return ProverOptions.safeParse(JSON.parse(json)).data ?? null; } catch { return null; }
 }
 
 function readPipelineRuntimeSettings(

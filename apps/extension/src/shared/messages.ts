@@ -8,6 +8,8 @@ import type {
   InformalAuditVerdict,
   OverleafDocumentSnapshot,
   OverleafProjectContext,
+  ProofArgument,
+  ProverOptions,
   ProviderConfigSummary,
   ProvisionEvent,
   ProvisionStateResponse,
@@ -78,6 +80,10 @@ export interface ExtensionState {
   // Most recent provisioning log lines for live progress. Capped to keep
   // chrome.storage payloads small.
   provisionEvents: ProvisionEvent[];
+  /** Model and budget for Check proof steps; kept across sessions. */
+  proverPreferences: ProverOptions;
+  /** The argument from the most recent Check proof steps run that reached its steps. */
+  latestArgument: { runId: string; claimId: string; argument: ProofArgument } | null;
   error: string | null;
   updatedAt: string;
 }
@@ -103,7 +109,8 @@ export type SidepanelToBackgroundMessage =
   | { type: 'sidepanel.clearBearerToken' }
   | { type: 'sidepanel.startProvision'; force?: boolean }
   | { type: 'sidepanel.setOpenRouterKey'; key: string }
-  | { type: 'sidepanel.clearOpenRouterKey' };
+  | { type: 'sidepanel.clearOpenRouterKey' }
+  | { type: 'sidepanel.setProverPreferences'; preferences: ProverOptions };
 
 export type BackgroundToContentMessage = { type: 'content.jumpToSource'; startOffset: number };
 

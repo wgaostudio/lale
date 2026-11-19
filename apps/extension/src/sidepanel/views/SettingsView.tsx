@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { Button, IconButton, Input, Panel, Section, Status } from '@lale/ui';
+import type { ProverOptions } from '@lale/protocol';
 import type { ExtensionState } from '../../shared/messages';
 import { TopBar } from '../components/TopBar';
 
@@ -111,6 +112,62 @@ function ProviderKeys({
   );
 }
 
+const PROVER_MODELS: Array<{ value: string; label: string }> = [
+  { value: '', label: 'Configured proposer model' },
+  { value: 'openai/gpt-6.2-astra', label: 'GPT-6.2 Astra' },
+  { value: 'anthropic/claude-fable-5.2', label: 'Claude Fable 5.2' },
+];
+
+/**
+ * Check proof steps runs an agent per step, billed to your key. The budget is
+ * per step: a hard budget allows long research-level steps, and also refuses
+ * to let the prover give up early, so it costs more on a step that is false.
+ */
+function ProverSettings({
+  preferences,
+  onChange,
+}: {
+  preferences: ProverOptions;
+  onChange: (preferences: ProverOptions) => void;
+}) {
+  return (
+    <Section label="Check proof steps">
+      <label className="setting-row">
+        <span className="lale-label">Prover model</span>
+        <select
+          className="lale-input"
+          value={preferences.model ?? ''}
+          onChange={(event) => {
+            const model = event.target.value;
+            onChange(model
+              ? { ...preferences, model: model as NonNullable<ProverOptions['model']> }
+              : { budget: preferences.budget });
+          }}
+        >
+          {PROVER_MODELS.map((m) => (
+            <option key={m.value} value={m.value}>{m.label}</option>
+          ))}
+        </select>
+      </label>
+      <label className="setting-row">
+        <span className="lale-label">Budget per step</span>
+        <select
+          className="lale-input"
+          value={preferences.budget}
+          onChange={(event) => onChange({ ...preferences, budget: event.target.value as ProverOptions['budget'] })}
+        >
+          <option value="standard">Standard — up to $2 a step</option>
+          <option value="hard">Hard — up to $25 a step, at least $5 before giving up</option>
+        </select>
+      </label>
+      <p className="lale-muted advisory-note">
+        Each step of your proof is proved separately. A step the prover cannot prove is reported
+        with what it found missing. Spending stops at the ceiling.
+      </p>
+    </Section>
+  );
+}
+
 function Provisioning({
   state,
   onStartProvision,
@@ -192,6 +249,7 @@ export function SettingsView({
   onSaveKey,
   onClearKey,
   onStartProvision,
+  onSetProverPreferences,
 }: {
   state: ExtensionState;
   onClose: () => void;
@@ -199,6 +257,7 @@ export function SettingsView({
   onSaveKey: (key: string) => void;
   onClearKey: () => void;
   onStartProvision: () => void;
+  onSetProverPreferences: (preferences: ProverOptions) => void;
 }) {
   return (
     <>
@@ -226,6 +285,7 @@ export function SettingsView({
         </div>
       </Section>
       <ProviderKeys state={state} onSaveKey={onSaveKey} onClearKey={onClearKey} />
+      <ProverSettings preferences={state.proverPreferences} onChange={onSetProverPreferences} />
       <Provisioning state={state} onStartProvision={onStartProvision} />
     </>
   );

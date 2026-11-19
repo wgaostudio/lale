@@ -2,6 +2,7 @@ import type { ParsedClaim } from '@lale/document-parser';
 import type { VerificationMode } from '@lale/protocol';
 import { Button, Panel, Pill, Section, Status } from '@lale/ui';
 import type { ExtensionState } from '../../shared/messages';
+import { ArgumentView } from '../components/ArgumentView';
 import { InformalAudit } from '../components/InformalAudit';
 import { LatexBlock } from '../components/Latex';
 import { TopBar } from '../components/TopBar';
@@ -137,6 +138,12 @@ export function ClaimDetail({
             claimId={claim.id}
             onAcknowledge={onAcknowledge}
           />
+        </Section>
+      )}
+
+      {verifiable && state.latestArgument?.claimId === claim.id && (
+        <Section label="Your argument, step by step">
+          <ArgumentView argument={state.latestArgument.argument} />
         </Section>
       )}
 

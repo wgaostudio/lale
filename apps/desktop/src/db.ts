@@ -170,6 +170,16 @@ CREATE TABLE IF NOT EXISTS proof_steps (
   artifactsJson TEXT NOT NULL DEFAULT '{}'
 );
 
+-- Check proof steps: the cited results and the composition, one row per run.
+-- The steps themselves are in proof_steps.
+CREATE TABLE IF NOT EXISTS proof_arguments (
+  auditRunId      TEXT PRIMARY KEY REFERENCES audit_runs(auditRunId),
+  citationsJson   TEXT NOT NULL DEFAULT '[]',
+  compositionJson TEXT,
+  agentSpendUsd   REAL NOT NULL DEFAULT 0,
+  createdAt       TEXT NOT NULL
+);
+
 -- §10.12 (post-v0)
 CREATE TABLE IF NOT EXISTS retrieval_queries (
   retrievalQueryId TEXT PRIMARY KEY,
@@ -268,11 +278,19 @@ export function openDb(dbPath?: string): Database.Database {
     migrateProverToProposer(db);
     migrateAuditRunMode(db);
     migrateAuditRunPausedStatus(db);
+    migrateAuditRunProverOptions(db);
     return db;
   } catch (error) {
     db.close();
     throw error;
   }
+}
+
+/** Model and budget preset chosen for the run's prover, as JSON; null for older runs. */
+function migrateAuditRunProverOptions(db: Database.Database): void {
+  const columns = db.prepare('PRAGMA table_info(audit_runs)').all() as Array<{ name: string }>;
+  if (columns.some((column) => column.name === 'proverOptionsJson')) return;
+  db.exec('ALTER TABLE audit_runs ADD COLUMN proverOptionsJson TEXT');
 }
 
 function migrateAuditRunMode(db: Database.Database): void {
@@ -441,6 +459,7 @@ export interface AuditRunRow {
   requestId: string;
   status: string;
   mode: VerificationMode;
+  proverOptionsJson: string | null;
   phase: string | null;
   startedAt: string;
   finishedAt: string | null;

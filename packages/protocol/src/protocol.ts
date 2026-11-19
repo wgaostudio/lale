@@ -155,6 +155,28 @@ export type OverleafDocumentSnapshot = z.infer<typeof OverleafDocumentSnapshot>;
 export const VerificationMode = z.enum(['full', 'formalizeOnly', 'proofSkeleton']);
 export type VerificationMode = z.infer<typeof VerificationMode>;
 
+/**
+ * Models offered for proving. GPT-6.2 Astra and Claude Fable 5.2 lead
+ * research-level formalization benchmarks as of Nov 2026. OpenRouter IDs.
+ */
+export const ProverModel = z.enum(['openai/gpt-6.2-astra', 'anthropic/claude-fable-5.2']);
+export type ProverModel = z.infer<typeof ProverModel>;
+
+/**
+ * Dollar budgets for the agent, per step. `standard` suits a lemma or a
+ * textbook argument; `hard` is for research-level steps, where one step can
+ * take an hour of agent work.
+ */
+export const ProverBudgetPreset = z.enum(['standard', 'hard']);
+export type ProverBudgetPreset = z.infer<typeof ProverBudgetPreset>;
+
+export const ProverOptions = z.object({
+  /** Omitted: the configured proposer model. */
+  model: ProverModel.optional(),
+  budget: ProverBudgetPreset.default('standard'),
+});
+export type ProverOptions = z.infer<typeof ProverOptions>;
+
 export const VerificationRequest = z.object({
   protocolVersion: ProtocolVersion,
   requestId: z.string(),
@@ -164,6 +186,7 @@ export const VerificationRequest = z.object({
   parsedDocumentFingerprint: z.string(),
   parserVersion: z.string(),
   mode: VerificationMode.default('full'),
+  prover: ProverOptions.optional(),
 });
 export type VerificationRequest = z.infer<typeof VerificationRequest>;
 
@@ -177,6 +200,58 @@ export const AcceptedRunResponse = z.object({
 });
 export type AcceptedRunResponse = z.infer<typeof AcceptedRunResponse>;
 
+// The author's argument as Check proof steps found it (GET /v1/runs/:runId).
+export const ArgumentCitation = z.object({
+  idx: z.number().int(),
+  name: z.string(),
+  statement: z.string(),
+  status: z.enum(['assumed', 'discharged', 'rejected', 'unstated']),
+  reason: z.string(),
+  leanSource: z.string().nullable(),
+  backtranslation: z.string().nullable(),
+});
+export type ArgumentCitation = z.infer<typeof ArgumentCitation>;
+
+export const ArgumentStep = z.object({
+  idx: z.number().int(),
+  claim: z.string(),
+  sourceText: z.string(),
+  /** Whether the step could be stated in Lean. */
+  status: z.enum(['pending', 'checked', 'failed', 'blocked']),
+  proofStatus: z.enum(['proved', 'unproved', 'skipped']),
+  closedBy: z.string().nullable(),
+  uses: z.array(z.number().int()),
+  cites: z.array(z.number().int()),
+  /** The step as stated in Lean. */
+  leanStatement: z.string().nullable(),
+  backtranslation: z.string().nullable(),
+  diagnostics: z.array(z.string()),
+  /** The prover's account when it could not prove the step — often the gap. */
+  report: z.string().nullable(),
+  spentUsd: z.number().nullable(),
+  turns: z.number().int().nullable(),
+});
+export type ArgumentStep = z.infer<typeof ArgumentStep>;
+
+export const ArgumentComposition = z.object({
+  status: z.enum(['proved', 'unproved', 'skipped']),
+  conditionalOn: z.array(z.string()),
+  closedBy: z.string().nullable(),
+  report: z.string().nullable(),
+  diagnostics: z.array(z.string()),
+});
+export type ArgumentComposition = z.infer<typeof ArgumentComposition>;
+
+export const ProofArgument = z.object({
+  steps: z.array(ArgumentStep),
+  citations: z.array(ArgumentCitation),
+  composition: ArgumentComposition.nullable(),
+  agentSpendUsd: z.number(),
+  proverModel: z.string().nullable(),
+  budget: ProverBudgetPreset.nullable(),
+});
+export type ProofArgument = z.infer<typeof ProofArgument>;
+
 // Final run result (GET /v1/runs/:runId)
 export const RunResult = z.object({
   protocolVersion: ProtocolVersion,
@@ -188,6 +263,8 @@ export const RunResult = z.object({
   leanSource: z.string().nullable(),
   diagnostics: z.array(z.string()),
   durationMs: z.number().nullable(),
+  /** Present for Check proof steps runs that reached the steps. */
+  argument: ProofArgument.nullable().default(null),
 });
 export type RunResult = z.infer<typeof RunResult>;
 
