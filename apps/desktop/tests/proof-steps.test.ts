@@ -161,10 +161,10 @@ test('author steps are proved by the agent and composed into the frozen theorem'
   assert.deepEqual(agentPurposes, ['step', 'step']);
   assert.equal(result.composition.status, 'proved');
   assert.deepEqual(result.composition.conditionalOn, []);
-  assert.equal(result.composition.closedBy, 'exact step2');
+  assert.equal(result.composition.closedBy, 'exact target_step2');
   const source = result.composition.leanSource!;
-  assert.ok(source.indexOf('theorem step1') < source.indexOf('theorem step2'));
-  assert.ok(source.indexOf('theorem step2') < source.indexOf('theorem target'));
+  assert.ok(source.indexOf('theorem target_step1') < source.indexOf('theorem target_step2'));
+  assert.ok(source.indexOf('theorem target_step2') < source.indexOf('theorem target :'));
   assert.ok(containsObligation(FROZEN.leanSource, source, 'target'), 'the frozen header survives verbatim');
   assert.ok(result.agentSpendUsd > 0);
 });
@@ -178,16 +178,16 @@ test('a cited result is stated, screened, assumed, and makes the result conditio
   });
   const [citation] = result.citations;
   assert.equal(citation!.status, 'assumed');
-  assert.equal(citation!.leanName, 'laleCite1');
-  assert.match(citation!.leanSource!, /def laleCite1 : Prop := \(∀ n : Nat, C n\)/);
-  assert.ok(checks.some((c) => c.options.declarationName === 'laleCite1_refuted'), 'refutation was tried');
+  assert.equal(citation!.leanName, 'laleCite_target_1');
+  assert.match(citation!.leanSource!, /def laleCite_target_1 : Prop := \(∀ n : Nat, C n\)/);
+  assert.ok(checks.some((c) => c.options.declarationName === 'laleCite_target_1_refuted'), 'refutation was tried');
 
-  assert.match(result.steps[0]!.leanSource!, /theorem step1 : laleCite1 → \(∀ n : Nat, P1 n\)/, 'the citation is a premise of the step');
-  assert.doesNotMatch(result.steps[1]!.leanSource!, /laleCite1/);
+  assert.match(result.steps[0]!.leanSource!, /theorem target_step1 : laleCite_target_1 → \(∀ n : Nat, P1 n\)/, 'the citation is a premise of the step');
+  assert.doesNotMatch(result.steps[1]!.leanSource!, /laleCite_target_1/);
 
   assert.equal(result.composition.status, 'proved');
-  assert.deepEqual(result.composition.conditionalOn, ['laleCite1']);
-  assert.match(result.composition.obligation!, /theorem target_givenCitations : laleCite1 → \(∀ n : Nat, n \+ 0 = n\)/);
+  assert.deepEqual(result.composition.conditionalOn, ['laleCite_target_1']);
+  assert.match(result.composition.obligation!, /theorem target_givenCitations : laleCite_target_1 → \(∀ n : Nat, n \+ 0 = n\)/);
   assert.ok(result.composition.leanSource!.startsWith('import Mathlib\nsection'), 'the citation prelude comes first');
   assert.ok(!scanTrustViolations(result.composition.leanSource!).length, 'no axioms, no sorry');
 });
@@ -196,12 +196,12 @@ test('a citation Mathlib can prove is discharged, not assumed', async () => {
   const { result } = await run({
     citations: [{ name: 'a standard fact', statement: 'n + 0 = n' }],
     steps: [{ claim: 'the conclusion', cites: [1] }],
-    ladderCloses: new Set(['laleCite1_stmt', 'target']),
+    ladderCloses: new Set(['laleCite_target_1_stmt', 'target']),
     agent: { step: 'prove' },
   });
   assert.equal(result.citations[0]!.status, 'discharged');
-  assert.match(result.citations[0]!.leanSource!, /theorem laleCite1_holds : laleCite1/);
-  assert.doesNotMatch(result.steps[0]!.leanSource!, /laleCite1 →/, 'a discharged citation is not a premise');
+  assert.match(result.citations[0]!.leanSource!, /theorem laleCite_target_1_holds : laleCite_target_1/);
+  assert.doesNotMatch(result.steps[0]!.leanSource!, /laleCite_target_1 →/, 'a discharged citation is not a premise');
   assert.deepEqual(result.composition.conditionalOn, []);
 });
 
@@ -209,7 +209,7 @@ test('a citation Lean refutes is rejected, and the steps citing it are not check
   const { result, agentPurposes } = await run({
     citations: [{ name: 'a false lemma', statement: 'every n is 0' }],
     steps: [{ claim: 'apply it', cites: [1] }],
-    ladderCloses: new Set(['laleCite1_refuted']),
+    ladderCloses: new Set(['laleCite_target_1_refuted']),
     agent: { step: 'prove' },
   });
   assert.equal(result.citations[0]!.status, 'rejected');
@@ -224,7 +224,7 @@ test("a step whose Lean statement does not read back as the author's is restated
   const { result, calls } = await run({
     steps: [{ claim: 'the conclusion' }],
     misstatedOnce: new Set(['the conclusion']),
-    ladderCloses: new Set(['step1', 'target']),
+    ladderCloses: new Set(['target_step1', 'target']),
     agent: { step: 'prove' },
   });
   assert.deepEqual(calls.filter((c) => c.startsWith('stateStep')), ['stateStep:1', 'stateStep:1']);
@@ -261,8 +261,8 @@ test('without an agent, steps get the one-shot prover and composition is left to
 
 test('withPremises and containsObligation', () => {
   assert.equal(
-    withPremises('import Mathlib\nopen Nat\ntheorem s : ∀ n, P n := by sorry', 's', ['laleCite1', 'laleCite2']),
-    'import Mathlib\nopen Nat\ntheorem s : laleCite1 → laleCite2 → (∀ n, P n) := by sorry',
+    withPremises('import Mathlib\nopen Nat\ntheorem s : ∀ n, P n := by sorry', 's', ['laleCite_target_1', 'laleCite2']),
+    'import Mathlib\nopen Nat\ntheorem s : laleCite_target_1 → laleCite2 → (∀ n, P n) := by sorry',
   );
   const frozen = 'import Mathlib\ntheorem t : True := by sorry';
   assert.ok(containsObligation(frozen, 'import Mathlib\ntheorem h : True := trivial\ntheorem t : True := by\n  exact h', 't'));

@@ -102,7 +102,7 @@ export interface CitationResult {
   name: string;
   statement: string;
   sourceText: string;
-  /** `laleCite<idx>`, the `Prop` definition steps take as a hypothesis. */
+  /** `laleCite_<theorem>_<idx>`, the `Prop` definition steps take as a hypothesis. */
   leanName: string;
   /** The definition, or for a discharged citation the definition plus its proof. */
   leanSource: string | null;
@@ -211,8 +211,13 @@ function addUsage(total: TokenUsage, usage: TokenUsage): void {
   total.outputTokens += usage.outputTokens;
 }
 
-export function citationName(idx: number): string {
-  return `laleCite${idx}`;
+/**
+ * Named after the theorem as well as the index: an accepted proof carries its
+ * citation definitions, and a claim that cites two such proofs would otherwise
+ * see `laleCite1` declared twice.
+ */
+export function citationName(theoremName: string, idx: number): string {
+  return `laleCite_${theoremName}_${idx}`;
 }
 
 /**
@@ -311,7 +316,7 @@ export async function checkProofSkeleton(
   const citations: CitationResult[] = [];
   for (const [index, spec] of segmented.citations.entries()) {
     const citation = await checkCitation(
-      auxiliaryClient, formalizerClient, runner, spec, index + 1, depDecls, context, leanVersion, mathlibRevision, options,
+      frozen.theoremName, auxiliaryClient, formalizerClient, runner, spec, index + 1, depDecls, context, leanVersion, mathlibRevision, options,
       runAgent, totalUsage,
     );
     citations.push(citation);
@@ -343,7 +348,7 @@ export async function checkProofSkeleton(
 
     const result = await checkStep(
       auxiliaryClient, formalizerClient, runner,
-      { frozenStatement: frozen.leanSource, depDecls: stepEnvironment, leanVersion, mathlibRevision },
+      { frozenStatement: frozen.leanSource, theoremName: frozen.theoremName, depDecls: stepEnvironment, leanVersion, mathlibRevision },
       context, spec, index + 1, established, premises, options,
     );
     addUsage(totalUsage, { inputTokens: result.usageInput, outputTokens: result.usageOutput });
@@ -396,6 +401,8 @@ type AgentRunner = (scope: string, frozen: FrozenTheorem, deps: string, purpose:
 
 interface StepEnvironment {
   frozenStatement: string;
+  /** Steps are renamed `<theorem>_step<idx>`, so two claims' proofs can be cited together. */
+  theoremName: string;
   depDecls: string;
   leanVersion: string;
   mathlibRevision: string;
@@ -409,6 +416,7 @@ function stripInternal(result: InternalStepResult): ProofStepResult {
 }
 
 async function checkCitation(
+  frozenTheoremName: string,
   auxiliaryClient: ModelClient,
   formalizerClient: ModelClient,
   runner: LeanRunner,
@@ -422,7 +430,7 @@ async function checkCitation(
   runAgent: AgentRunner,
   totalUsage: TokenUsage,
 ): Promise<CitationResult> {
-  const leanName = citationName(idx);
+  const leanName = citationName(frozenTheoremName, idx);
   const result: CitationResult = {
     idx, name: spec.name, statement: spec.statement, sourceText: spec.sourceText, leanName,
     leanSource: null, status: 'unstated', reason: 'Could not be stated in Lean', backtranslation: null,
@@ -558,6 +566,7 @@ async function checkStep(
   };
 
   let previousError: string | undefined;
+  const stepName = `${env.theoremName}_step${idx}`;
 
   for (let attempt = 0; attempt < MAX_STEP_ATTEMPTS; attempt++) {
     options.onProgress?.(`Step ${idx}: stating in Lean (attempt ${attempt + 1})`, { idx, attempt });
@@ -591,7 +600,7 @@ async function checkStep(
       parseObligation(formalized.leanSource, formalized.theoremName);
       // Cited results the step invokes become its hypotheses: the step is
       // checked *given* them, exactly as the author argues it.
-      stepSource = premises.length ? withPremises(formalized.leanSource, formalized.theoremName, premises) : formalized.leanSource;
+      stepSource = withPremises(formalized.leanSource, formalized.theoremName, premises, stepName);
     } catch (err) {
       base.leanSource = formalized.leanSource;
       base.theoremName = formalized.theoremName;
@@ -601,11 +610,11 @@ async function checkStep(
       continue;
     }
     base.leanSource = stepSource;
-    base.theoremName = formalized.theoremName;
+    base.theoremName = stepName;
 
     const leanResult = await runner.check(
       composeLeanFile(env.depDecls, stepSource),
-      { allowTrustViolations: ['sorry'], declarationName: formalized.theoremName },
+      { allowTrustViolations: ['sorry'], declarationName: stepName },
     );
 
     if (leanResult.status === 'blocked') {
