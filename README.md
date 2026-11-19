@@ -110,8 +110,15 @@ without a stored mode default to `full`.
   obligation parser and Lean harness that decide what reaches the kernel. Pipeline tests stub the model, Lean, and keychain; they
   skip when the optional `keytar` module cannot load. Live Lean and browser
   integration remain manual checks. The obsolete `test:lean` command was removed.
-- `pnpm evals` checks three bundled fixtures. Running with `--live` uses a running
-  desktop service and paid model requests, and requires `LALE_DESKTOP_TOKEN`.
+- `pnpm evals` validates the bundled fixtures (`evals/claims/cases.json`). Six are
+  Check proof steps cases with known answers: a sound proof, a true theorem with
+  a false step, a false theorem with a plausible proof, a citation Mathlib can
+  discharge, one it cannot, and a proof whose steps stop short of the theorem.
+  A case passes only if the run fails *where* it should — a false step must be
+  the step reported, not just an incomplete outcome — and a pass of a false
+  theorem is flagged as a false acceptance. `--live` runs them against a running
+  desktop service with paid model requests (`LALE_DESKTOP_TOKEN` required);
+  `--only id,id` runs a subset.
 - **Check proof steps** uses an agentic prover (`apps/desktop/src/pipeline/agent/`)
   when model prices are known. Per step, it works through typed tools (helper
   files in a per-theorem namespace, Lean checks with `sorry` allowed, `exact?`

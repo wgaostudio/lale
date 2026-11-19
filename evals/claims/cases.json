@@ -15,6 +15,63 @@
     "id": "false-zero-one",
     "claimId": "thm:false",
     "latex": "\\begin{theorem}\\label{thm:false} In the natural numbers, $0 = 1$.\\end{theorem}\n\\begin{proof}This is immediate.\\end{proof}",
-    "expected": ["proofIncomplete"]
+    "expected": ["proofIncomplete"],
+    "mustNotPass": true
+  },
+  {
+    "id": "steps-sound",
+    "about": "A sound three-step argument. Every step should be proved and compose.",
+    "mode": "proofSkeleton",
+    "claimId": "thm:even-sum",
+    "latex": "\\begin{theorem}\\label{thm:even-sum} If $a$ and $b$ are even integers, then $a + b$ is even.\\end{theorem}\n\\begin{proof}Since $a$ is even, $a = 2k$ for some integer $k$. Since $b$ is even, $b = 2l$ for some integer $l$. Then $a + b = 2k + 2l = 2(k + l)$, so $a + b$ is even.\\end{proof}",
+    "expected": ["verified"],
+    "argument": { "allStepsProved": true, "composes": true }
+  },
+  {
+    "id": "steps-false-step",
+    "about": "The theorem is true but the proof's first step is false (n^2 is not always even). The gap must land on that step, not on the theorem.",
+    "mode": "proofSkeleton",
+    "claimId": "thm:sq-plus",
+    "latex": "\\begin{theorem}\\label{thm:sq-plus} For every natural number $n$, $n^2 + n$ is even.\\end{theorem}\n\\begin{proof}For every natural number $n$, $n^2$ is even. Also $n^2$ and $n$ have the same parity. Hence $n^2 + n$ is the sum of two even numbers, so it is even.\\end{proof}",
+    "expected": ["proofIncomplete"],
+    "argument": { "failingStepMentions": ["n^2", "even"], "failingStepNotMentions": ["n^2 + n", "n^2+n"] }
+  },
+  {
+    "id": "steps-false-theorem",
+    "about": "A false theorem with a plausible-sounding proof. Any pass is a false acceptance.",
+    "mode": "proofSkeleton",
+    "claimId": "thm:odd-prime",
+    "latex": "\\begin{theorem}\\label{thm:odd-prime} Every odd natural number $n > 1$ is prime.\\end{theorem}\n\\begin{proof}Since $n$ is odd, $2$ does not divide $n$. A number with no factor $2$ has no proper factors at all. Hence $n$ is prime.\\end{proof}",
+    "expected": ["proofIncomplete"],
+    "mustNotPass": true,
+    "argument": { "failingStepMentions": ["factor"] }
+  },
+  {
+    "id": "steps-citation-discharged",
+    "about": "Cites a classical theorem Mathlib already has. The citation should be discharged, so the pass is unconditional.",
+    "mode": "proofSkeleton",
+    "claimId": "thm:flt-little",
+    "latex": "\\begin{theorem}\\label{thm:flt-little} Let $p$ be a prime and $a$ an integer not divisible by $p$. Then $a^{2(p-1)} \\equiv 1 \\pmod p$.\\end{theorem}\n\\begin{proof}By Fermat's little theorem, $a^{p-1} \\equiv 1 \\pmod p$. Squaring both sides gives $a^{2(p-1)} \\equiv 1 \\pmod p$.\\end{proof}",
+    "expected": ["verified"],
+    "argument": { "citations": [{ "nameMentions": "Fermat", "status": ["discharged"] }], "composes": true }
+  },
+  {
+    "id": "steps-citation-assumed",
+    "about": "Cites a computational result far beyond what a proof assistant can check here. It should be assumed, and the pass reported as conditional on it.",
+    "mode": "proofSkeleton",
+    "claimId": "thm:goldbach-small",
+    "latex": "\\begin{theorem}\\label{thm:goldbach-small} Every even integer $n$ with $4 \\le n \\le 10^{18}$ is the sum of two primes.\\end{theorem}\n\\begin{proof}Oliveira e Silva, Herzog and Pardi verified by computer that every even integer $n$ with $4 \\le n \\le 4 \\cdot 10^{18}$ is the sum of two primes. Since $10^{18} \\le 4 \\cdot 10^{18}$, the claim follows.\\end{proof}",
+    "expected": ["verifiedGivenCitations"],
+    "mustNotPass": false,
+    "argument": { "citations": [{ "nameMentions": "Oliveira", "status": ["assumed"] }], "composes": true }
+  },
+  {
+    "id": "steps-do-not-compose",
+    "about": "The proof establishes only half of the conclusion. lale should report that the steps do not reach the theorem. If it passes, segmentation filled in a step the author never made.",
+    "mode": "proofSkeleton",
+    "claimId": "thm:half",
+    "latex": "\\begin{theorem}\\label{thm:half} For every real number $x$, $x^2 \\ge 0$ and $x^2 + 2x + 2 > 0$.\\end{theorem}\n\\begin{proof}The square of a real number is nonnegative, so $x^2 \\ge 0$.\\end{proof}",
+    "expected": ["proofIncomplete"],
+    "argument": { "composes": false }
   }
 ]
