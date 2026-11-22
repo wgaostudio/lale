@@ -101,6 +101,14 @@ function fakeClients(scenario: Scenario) {
       text = JSON.stringify({ theoremName: 'cited', leanSource: 'import Mathlib\ntheorem cited : ∀ n : Nat, C n := by sorry' });
     } else if (system.includes('mathematical writing assistant')) {
       text = user.includes('P') ? `reads back: ${/theorem (\w+)/.exec(user)?.[1]}` : 'reads back';
+    } else if (system.includes('proof step comparison')) {
+      calls.push('compareStep');
+      const thisStep = /## This step, in the author's words\n([^\n]*)/.exec(user)?.[1] ?? '';
+      assert.match(user, /## Theorem being proved\nFor every n, n \+ 0 = n\./, 'the step is judged against the theorem');
+      const stepClaim = scenario.steps.find((s) => s.claim === thisStep)?.claim;
+      const wrong = stepClaim && scenario.misstatedOnce?.has(stepClaim) && !misstated.has(stepClaim);
+      if (wrong) misstated.add(stepClaim!);
+      text = JSON.stringify({ agreement: wrong ? 'disagree' : 'agree', explanation: wrong ? 'weaker than the step' : 'same' });
     } else if (system.includes('statement comparison')) {
       const stepClaim = scenario.steps.find((s) => user.includes(s.claim))?.claim;
       const wrong = stepClaim && scenario.misstatedOnce?.has(stepClaim) && !misstated.has(stepClaim);

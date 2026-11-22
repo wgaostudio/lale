@@ -455,6 +455,53 @@ ${backtranslatedNL}`;
   };
 }
 
+const STEP_COMPARE_SYSTEM = `You are a proof step comparison assistant.
+An author's proof was split into steps, and one step was stated as a self-contained formal proposition. You are given the theorem, the earlier steps, the author's wording of this step, and the formal proposition read back into English. Judge whether the formal proposition says what this step says, in the context of the proof.
+
+Output a single JSON object:
+{
+  "agreement": "agree" | "disagree" | "uncertain",
+  "explanation": "<one sentence>"
+}
+
+A step written mid-proof refers to objects the proof has fixed and relies on what it has assumed. A self-contained statement of it must therefore make these explicit, and doing so is NOT a difference:
+- quantifying over the objects the proof fixes: the theorem's variables, and objects introduced by earlier steps (a witness k from "there is k with ...");
+- assuming the theorem's hypotheses, and the conclusions of earlier steps the step relies on;
+- assuming a cited result the step invokes.
+
+These ARE differences ("disagree"):
+- the conclusion differs from the step's: weaker, stronger, about different objects, or with changed quantifiers or direction;
+- an assumption that is neither a hypothesis of the theorem, nor an earlier step's conclusion, nor a cited result — in particular one that assumes the step's own conclusion or otherwise makes it trivial;
+- the proposition is the whole theorem, or a different step, rather than this one.`;
+
+export async function compareStepFaithfulness(
+  client: ModelClient,
+  context: { theorem: string; earlierSteps: string[]; step: string; backtranslated: string; ambientContext?: string },
+): Promise<FaithfulnessComparisonResult> {
+  const earlier = context.earlierSteps.length
+    ? context.earlierSteps.map((s, i) => `${i + 1}. ${s}`).join('\n')
+    : '(none; this is the first step)';
+  const userContent = `## Theorem being proved
+${context.theorem}${formatAmbientContext(context.ambientContext)}
+
+## Earlier steps of the proof
+${earlier}
+
+## This step, in the author's words
+${context.step}
+
+## The formal proposition for this step, read back
+${context.backtranslated}`;
+
+  const { text, usage } = await client.complete(STEP_COMPARE_SYSTEM, userContent, 1024);
+  const json = extractJson(text);
+  return {
+    agreement: enumValue(json.agreement, ['agree', 'disagree', 'uncertain'] as const),
+    explanation: requiredString(json, 'explanation'),
+    usage,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Prove equivalence goal (tier-2 roundtrip, proposer role)
 // ---------------------------------------------------------------------------

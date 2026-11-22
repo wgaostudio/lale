@@ -2,6 +2,7 @@ import {
   BudgetExceededError,
   backtranslate,
   compareFaithfulness,
+  compareStepFaithfulness,
   formalizeProofStep,
   formalizeStatement,
   proposeProof,
@@ -376,6 +377,7 @@ export async function checkProofSkeleton(
       auxiliaryClient, formalizerClient, runner,
       { frozenStatement: frozen.leanSource, theoremName: frozen.theoremName, depDecls: stepEnvironment, leanVersion, mathlibRevision },
       context, spec, index + 1, established, premises, options,
+      segmented.steps.slice(0, index).map((s) => s.claim),
     );
     addUsage(totalUsage, { inputTokens: result.usageInput, outputTokens: result.usageOutput });
 
@@ -574,6 +576,8 @@ async function checkStep(
   established: string[],
   premises: string[],
   options: ProofSkeletonOptions,
+  /** The author's earlier steps, which this step's statement may assume. */
+  earlierClaims: string[] = [],
 ): Promise<InternalStepResult> {
   const base: InternalStepResult = {
     idx,
@@ -663,7 +667,14 @@ async function checkStep(
       base.usageInput += usage.inputTokens;
       base.usageOutput += usage.outputTokens;
       base.backtranslation = nlStatement;
-      const comparison = await compareFaithfulness(auxiliaryClient, spec.claim, nlStatement, context.ambientContext);
+      // A step's Lean statement has to close over what the proof fixed and
+      // assumed, so it is judged as a step of this proof, not as a theorem.
+      // Judged as a theorem, "there is k with a = 2k" against "every even a
+      // has such a k" was rejected for doing exactly what it must.
+      const comparison = await compareStepFaithfulness(auxiliaryClient, {
+        theorem: context.statementText, earlierSteps: earlierClaims, step: spec.claim,
+        backtranslated: nlStatement, ambientContext: context.ambientContext,
+      });
       base.usageInput += comparison.usage.inputTokens;
       base.usageOutput += comparison.usage.outputTokens;
       if (comparison.agreement === 'disagree') {
