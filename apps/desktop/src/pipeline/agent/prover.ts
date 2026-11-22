@@ -49,6 +49,8 @@ const KEEP_RECENT_TOOL_RESULTS = 10;
 const SOFT_CONTEXT_BYTES = 600_000;
 const ELIDED_PREFIX_CHARS = 240;
 const MAX_IDLE_TURNS = 3;
+/** A turn smaller than this cannot reason and write a lemma; the budget is spent. */
+export const MIN_TURN_OUTPUT_TOKENS = 4096;
 const MAX_MODEL_RETRIES = 2;
 
 /** A step or theorem the agent may cite by name. */
@@ -348,18 +350,25 @@ export async function runAgentProver(input: AgentProverInput): Promise<AgentProv
       compactHistory(messages, 3);
       contextBytes = estimateChatBytes(messages, tools);
     }
-    // Worst case for the next request: the whole context read at the prompt
-    // price (bytes/4 tokens), the whole output ceiling written.
-    const worstNext = (contextBytes / 4) * input.pricing.prompt + maxOutput * input.pricing.completion;
-    if (spent() + worstNext > budget.ceilingUsd) {
-      return stopped('budget', `Stopped at ${usd(spent())}: the next turn could exceed the ${usd(budget.ceilingUsd)} ceiling.`);
+    // The next request's output limit is what the remaining budget can pay
+    // for in the worst case (whole context read at the prompt price, every
+    // output token written), capped at the usual per-turn limit. A fixed
+    // 32k-token worst case used to exceed small ceilings outright: a $0.50
+    // composition agent stopped before its first request.
+    const inputWorstUsd = (contextBytes / 4) * input.pricing.prompt;
+    const affordableOutput = input.pricing.completion > 0
+      ? Math.floor((budget.ceilingUsd - spent() - inputWorstUsd) / input.pricing.completion)
+      : maxOutput;
+    const turnOutput = Math.min(maxOutput, affordableOutput);
+    if (turnOutput < MIN_TURN_OUTPUT_TOKENS) {
+      return stopped('budget', `Stopped at ${usd(spent())}: the ${usd(budget.ceilingUsd)} ceiling leaves too little for another turn.`);
     }
 
     turn++;
     let reply: Awaited<ReturnType<ModelClient['chat']>>;
     for (let attempt = 0; ; attempt++) {
       try {
-        reply = await input.client.chat(messages, tools, maxOutput);
+        reply = await input.client.chat(messages, tools, turnOutput);
         break;
       } catch (error) {
         if (error instanceof BudgetExceededError) {

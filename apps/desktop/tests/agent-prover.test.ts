@@ -383,3 +383,33 @@ test('author-step prompts frame the step as the author asserts it, not as a free
   assert.match(user!.content, /`laleCite1`: Heine–Borel/);
   assert.match(user!.content, /`LaleAux\.target`/);
 });
+
+test('a small ceiling shrinks each turn instead of refusing to start', async () => {
+  // $40 per million output tokens: one 32k-token turn would be $1.31, over a
+  // $0.50 ceiling. The agent must still run, on smaller turns.
+  const { runner } = fakeRunner();
+  const limits: number[] = [];
+  const client = {
+    async chat(_messages: ChatMessage[], _tools: ChatToolSpec[], maxTokens: number) {
+      limits.push(maxTokens);
+      const submit = limits.length === 1
+        ? [{ id: 'a', name: 'set_proof', arguments: JSON.stringify({ body: 'simp' }) }, { id: 'b', name: 'submit', arguments: '{}' }]
+        : [];
+      return { message: { role: 'assistant' as const, content: null, toolCalls: submit }, finishReason: 'tool_calls', reasoning: null,
+        usage: { inputTokens: 2000, outputTokens: 1500 } };
+    },
+  } as unknown as ModelClient;
+  const result = await runAgentProver({
+    ...base, client, runner, pricing: { prompt: 2e-6, completion: 40e-6 },
+    budget: { ceilingUsd: 0.5, floorUsd: 0 },
+  });
+  assert.equal(result.outcome, 'verified');
+  assert.ok(limits[0]! < 32_768 && limits[0]! >= 4096, `first turn limit ${limits[0]}`);
+
+  // And when not even a minimal turn fits, it stops without a request.
+  let calls = 0;
+  const never = { async chat() { calls++; throw new Error('should not be called'); } } as unknown as ModelClient;
+  const broke = await runAgentProver({ ...base, client: never, runner, pricing: { prompt: 2e-6, completion: 40e-6 }, budget: { ceilingUsd: 0.1, floorUsd: 0 } });
+  assert.equal(broke.stopReason, 'budget');
+  assert.equal(calls, 0);
+});
