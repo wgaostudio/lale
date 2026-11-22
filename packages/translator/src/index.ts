@@ -736,28 +736,46 @@ ${cappedHints.map((moduleName) => `- ${moduleName}`).join('\n')}
 Use these exact module names only if they are relevant. If none fit, prefer \`import Mathlib\`.`;
 }
 
-function extractJson(text: string): Record<string, unknown> {
+/**
+ * Doubles every backslash that does not begin a valid JSON escape. Models put
+ * LaTeX in their explanations — `"\\(a\\)"` arrives as `"\(a\)"`, which
+ * JSON.parse rejects — and one such reply used to stop a whole run. Read in
+ * pairs, so an already-escaped `\\\\(` is left alone. Used only after a plain
+ * parse has failed, so well-formed replies are never rewritten.
+ */
+export function repairJsonEscapes(text: string): string {
+  let out = '';
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch !== '\\') { out += ch; continue; }
+    const next = text[i + 1] ?? '';
+    if ('"\\/bfnrt'.includes(next) && next !== '') { out += ch + next; i++; continue; }
+    if (next === 'u' && /^[0-9a-fA-F]{4}$/.test(text.slice(i + 2, i + 6))) { out += text.slice(i, i + 6); i += 5; continue; }
+    out += '\\\\';
+  }
+  return out;
+}
+
+export function parseModelJson(text: string): Record<string, unknown> {
   // Try to find a JSON object in the response, handling markdown code blocks.
   const stripped = text
     .replace(/^```(?:json)?\s*/m, '')
     .replace(/\s*```\s*$/m, '')
     .trim();
+  const block = /\{[\s\S]*\}/.exec(stripped)?.[0];
 
-  try {
-    return jsonObject(JSON.parse(stripped));
-  } catch {
-    // Fallback: find the first {...} block.
-    const match = /\{[\s\S]*\}/.exec(stripped);
-    if (match) {
-      try {
-        return jsonObject(JSON.parse(match[0]));
-      } catch {
-        // fall through
-      }
+  for (const candidate of [stripped, block, repairJsonEscapes(stripped), block && repairJsonEscapes(block)]) {
+    if (!candidate) continue;
+    try {
+      return jsonObject(JSON.parse(candidate));
+    } catch {
+      // next candidate
     }
-    throw new Error(`Model returned non-JSON response: ${text.slice(0, 200)}`);
   }
+  throw new Error(`Model returned non-JSON response: ${text.slice(0, 200)}`);
 }
+
+const extractJson = parseModelJson;
 
 function jsonObject(value: unknown): Record<string, unknown> {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('Expected JSON object');
