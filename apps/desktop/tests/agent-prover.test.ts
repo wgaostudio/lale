@@ -30,7 +30,7 @@ function fakeRunner(opts: { environmentFault?: boolean } = {}): { runner: LeanRu
       calls.push({ source, options });
       const base = { diagnostics: [], trustViolations: [], elapsedMs: 5, stdout: '', stderr: '' };
       if (opts.environmentFault) {
-        return { ...base, status: 'blocked', diagnostics: [{ kind: 'error', message: 'Failed to spawn Lean (ENOENT).' }] };
+        return { ...base, status: 'blocked', diagnostics: [{ kind: 'error', message: 'Lean could not run: failed to spawn Lean (ENOENT).' }] };
       }
       const violations = scanTrustViolations(source).filter((v) => !(options.allowTrustViolations ?? []).includes(v.name));
       if (violations.length) {

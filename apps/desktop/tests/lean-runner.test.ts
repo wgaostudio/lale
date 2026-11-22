@@ -187,15 +187,29 @@ test('a toolchain that cannot be spawned is an environment fault, not a bad proo
   // `blocked`, not `error`: callers stop the run rather than asking the model
   // to repair source that was never the problem.
   assert.equal(result.status, 'blocked');
-  assert.match(result.diagnostics.at(-1)!.message, /Failed to spawn Lean/);
+  assert.match(result.diagnostics.at(-1)!.message, /Lean could not run: failed to spawn Lean/);
 });
 
-test('a nonzero exit is reported with the stderr that explains it', async () => {
-  const { runner } = runnerWith({ stderr: 'lake: unknown package', exitCode: 1 });
+test('a nonzero exit before Lean checks the file is an environment fault, with the stderr', async () => {
+  // What a corrupt Mathlib dependency looks like: lake fails to load the
+  // workspace and Lean never sees the file. Reported as `error`, this once
+  // ended runs as malformedClaim, blaming the author's statement.
+  const { runner } = runnerWith({
+    stderr: "error: .lake/packages/batteries: could not resolve 'HEAD' to a commit",
+    exitCode: 1,
+  });
+  const result = await runner.check(THEOREM, { declarationName: 't' });
+
+  assert.equal(result.status, 'blocked');
+  assert.match(result.diagnostics.at(-1)!.message, /^Lean could not run: exited with code 1.*could not resolve 'HEAD'/s);
+});
+
+test('a nonzero exit with Lean errors about the file is still an error in the source', async () => {
+  const { runner } = runnerWith({ stdout: 'check.lean:2:20: error: unknown identifier foo', exitCode: 1 });
   const result = await runner.check(THEOREM, { declarationName: 't' });
 
   assert.equal(result.status, 'error');
-  assert.match(result.diagnostics.at(-1)!.message, /exited with code 1.*unknown package/s);
+  assert.match(result.diagnostics[0]!.message, /unknown identifier foo/);
 });
 
 test('an invalid memory cap is rejected at construction', () => {

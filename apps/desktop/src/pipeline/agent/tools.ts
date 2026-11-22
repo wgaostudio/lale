@@ -1,4 +1,5 @@
 import {
+  LEAN_UNAVAILABLE,
   isLeanDeclarationName,
   parseObligation,
   scanTrustViolations,
@@ -186,7 +187,7 @@ export function workspaceSummary(ws: Workspace): string {
 export function isEnvironmentFault(result: LeanCheckResult): boolean {
   return result.status === 'blocked'
     && result.trustViolations.length === 0
-    && result.diagnostics.some((d) => /Failed to spawn Lean|Lean harness error/.test(d.message));
+    && result.diagnostics.some((d) => d.message.startsWith(LEAN_UNAVAILABLE) || /Lean harness error/.test(d.message));
 }
 
 function sorryLocations(result: LeanCheckResult, segments: ReturnType<Workspace['compose']>['segments']): string[] {

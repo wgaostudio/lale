@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { homedir, platform } from 'node:os';
@@ -578,6 +578,17 @@ async function runProvision(provisionId: string, input: StartProvisionInput): Pr
   const env = withElanPath();
 
   emit('start', 'info', `Provisioning Lean ${input.leanVersion} + Mathlib ${input.mathlibRevision}`);
+
+  // A forced reprovision is usually a retry after a failed one, and a failed
+  // `lake update` can leave a half-cloned dependency that every later
+  // `lake` invocation trips over ("could not resolve 'HEAD'"). Start the
+  // dependencies from scratch; the Mathlib build cache lives outside the
+  // project, so the prebuilt files are not downloaded again.
+  if (input.force) {
+    await rm(join(input.projectDir, '.lake', 'packages'), { recursive: true, force: true });
+    await rm(join(input.projectDir, 'lake-manifest.json'), { force: true });
+    emit('start', 'info', 'Forced: removed downloaded dependencies to start them clean');
+  }
 
   try {
     const elanPresent = await detectElan(env);

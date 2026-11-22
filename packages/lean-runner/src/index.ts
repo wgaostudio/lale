@@ -250,6 +250,9 @@ export function parseDiagnostics(output: string): LeanDiagnostic[] {
   return diagnostics;
 }
 
+/** Prefix of every message for a check that never reached Lean. Callers match on it. */
+export const LEAN_UNAVAILABLE = 'Lean could not run';
+
 export class LeanRunner {
   private readonly wallClockCapMs: number;
   private readonly outputCapBytes: number;
@@ -417,8 +420,20 @@ export class LeanRunner {
           diagnostics.push({
             kind: 'error',
             message:
-              `Failed to spawn Lean (${spawnError.message}). Check that Lean is provisioned `
+              `${LEAN_UNAVAILABLE}: failed to spawn Lean (${spawnError.message}). Check that Lean is provisioned `
               + `and that ${ELAN_BIN_DIR} is readable.`,
+          });
+        } else if (!outputExceeded && signal === null && code !== 0 && diagnostics.length === 0) {
+          // Nonzero, but Lean said nothing about the file: it never checked
+          // it. `lake` failing to load a broken package, a missing toolchain,
+          // a corrupt Mathlib checkout. Reported as `error`, this reached the
+          // model as "your statement does not type-check" and ended runs as
+          // malformedClaim; it is the environment, and the run should stop.
+          status = 'blocked';
+          diagnostics.push({
+            kind: 'error',
+            message: `${LEAN_UNAVAILABLE}: exited with code ${code} before checking the file. `
+              + `Check the Lean install (reprovision if needed). ${stderr.trim().slice(0, 2000)}`,
           });
         } else if (outputExceeded || signal !== null || code !== 0) {
           status = 'error';
