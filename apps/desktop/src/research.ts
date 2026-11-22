@@ -18,6 +18,11 @@ import { CHECK_ORDER, prepareTestCopy } from './research/smoktunowicz.js';
 //
 //   pnpm research -- --source <reading copy .tex> [--budget hard] [--model id]
 //                    [--max-usd 150] [--only lem:3,thm:main] [--timeout-minutes 240]
+//   pnpm research -- --source <reading copy .tex> --prepare-only
+//
+// --prepare-only writes the test copy and stops: no service, token or spend.
+// Paste that file into an Overleaf project to run the same claims from the
+// side panel.
 //
 // Live only: needs a running desktop service, LALE_DESKTOP_TOKEN, Lean, and
 // credit on the OpenRouter key. Definitions are formalized; results go
@@ -47,6 +52,10 @@ const localDir = join(root, 'evals', 'research', 'smoktunowicz', 'local');
 await mkdir(localDir, { recursive: true });
 await writeFile(join(localDir, 'test-copy.tex'), testCopy);
 const doc = parseLatexDocument(testCopy);
+if (args.includes('--prepare-only')) {
+  console.log(`Test copy: ${join(localDir, 'test-copy.tex')} (${doc.claims.length} claims). Check order: ${CHECK_ORDER.join(' ')}`);
+  process.exit(0);
+}
 
 const token = process.env['LALE_DESKTOP_TOKEN'];
 if (!token) throw new Error('Set LALE_DESKTOP_TOKEN to the local companion token.');

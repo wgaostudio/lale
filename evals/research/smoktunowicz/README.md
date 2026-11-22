@@ -49,6 +49,14 @@ export LALE_DESKTOP_TOKEN=$(sqlite3 ~/.lale/lale.db "SELECT value FROM install_c
 pnpm research -- --source ~/path/to/graded-domains-corrected.tex --budget hard --max-usd 150
 ```
 
+To run it from the side panel instead, write the test copy without starting a
+run, paste `evals/research/smoktunowicz/local/test-copy.tex` into a private
+Overleaf project, and check the claims there in the same order:
+
+```bash
+pnpm research -- --source ~/path/to/graded-domains-corrected.tex --prepare-only
+```
+
 Options: `--model openai/gpt-6.2-astra|anthropic/claude-fable-5.2`,
 `--only lem:3,thm:main`, `--timeout-minutes 240` (per claim). Claims run in
 dependency order — `def:gk def:fg def:q lem:3 lem:1 lem:2 thm:as thm:3
