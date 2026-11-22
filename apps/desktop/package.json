@@ -11,7 +11,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "evals": "tsx src/evals.ts",
     "test": "tsx --test tests/*.test.ts",
-    "research": "tsx src/research.ts"
+    "research": "tsx src/research.ts",
+    "explain": "tsx src/explain-report.ts"
   },
   "dependencies": {
     "@lale/cache": "workspace:*",

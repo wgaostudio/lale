@@ -15,7 +15,8 @@
     "desktop:dev": "pnpm --filter @lale/desktop dev",
     "evals": "pnpm --filter @lale/desktop evals",
     "test": "pnpm --filter @lale/desktop test",
-    "research": "pnpm --filter @lale/desktop research"
+    "research": "pnpm --filter @lale/desktop research",
+    "explain": "pnpm --filter @lale/desktop explain"
   },
   "devDependencies": {
     "@types/node": "^25.6.2",
