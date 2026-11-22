@@ -573,9 +573,14 @@ function describeLeanResult(result: LeanCheckResult): string[] {
   return output.length > 0 ? output : [`Lean returned status ${result.status} with no diagnostics`];
 }
 
+/**
+ * One Lean file from dependency declarations and a source, with every
+ * `import` hoisted to the top, where Lean requires them. This runs even with
+ * no dependencies: a proof assembled from several parts (the author's step
+ * lemmas, then the composition) carries an `import` per part, and returning it
+ * unchanged failed the final recheck of the first proof built from steps.
+ */
 export function composeLeanFile(dependencyDeclarations: string, source: string): string {
-  if (!dependencyDeclarations.trim()) return source;
-
   const imports = new Set<string>();
   const bodyParts: string[] = [];
 

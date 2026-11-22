@@ -32,6 +32,12 @@ function fakeRunner(opts: { environmentFault?: boolean } = {}): { runner: LeanRu
       if (opts.environmentFault) {
         return { ...base, status: 'blocked', diagnostics: [{ kind: 'error', message: 'Lean could not run: failed to spawn Lean (ENOENT).' }] };
       }
+      // Lean accepts imports only at the start of a file.
+      const firstCode = source.split('\n').findIndex((l) => l.trim() && !/^\s*import\s/.test(l));
+      const lateImport = firstCode >= 0 && source.split('\n').slice(firstCode).some((l) => /^\s*import\s/.test(l));
+      if (lateImport) {
+        return { ...base, status: 'error', diagnostics: [{ kind: 'error', message: "invalid 'import' command, it must be used in the beginning of the file", line: 1 }] };
+      }
       const violations = scanTrustViolations(source).filter((v) => !(options.allowTrustViolations ?? []).includes(v.name));
       if (violations.length) {
         return { ...base, status: 'blocked', trustViolations: violations,

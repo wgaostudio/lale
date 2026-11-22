@@ -5,6 +5,7 @@ import type { ChatMessage, ModelClient } from '@lale/translator';
 import { checkProofSkeleton, withPremises, type ProofSkeletonOptions } from '../src/pipeline/proof-steps.js';
 import type { NormalizedClaimContext } from '../src/pipeline/context.js';
 import { TACTIC_LADDER } from '../src/pipeline/tactics.js';
+import { composeLeanFile } from '../src/pipeline/formalize.js';
 
 // The author-steps pipeline end to end, with every model and Lean faked:
 // segmentation, citation and step statements, back-translation, the agent's
@@ -57,6 +58,12 @@ function fakeRunner(scenario: Scenario) {
     async check(source: string, options: LeanCheckOptions = {}): Promise<LeanCheckResult> {
       checks.push({ source, options });
       const base = { diagnostics: [], trustViolations: [], elapsedMs: 1, stdout: '', stderr: '' };
+      // Lean accepts imports only at the start of a file.
+      const firstCode = source.split('\n').findIndex((l) => l.trim() && !/^\s*import\s/.test(l));
+      const lateImport = firstCode >= 0 && source.split('\n').slice(firstCode).some((l) => /^\s*import\s/.test(l));
+      if (lateImport) {
+        return { ...base, status: 'error', diagnostics: [{ kind: 'error', message: "invalid 'import' command, it must be used in the beginning of the file", line: 1 }] };
+      }
       const violations = scanTrustViolations(source).filter((v) => !(options.allowTrustViolations ?? []).includes(v.name));
       if (violations.length) {
         return { ...base, status: 'blocked', trustViolations: violations, diagnostics: [{ kind: 'error', message: 'Trust policy violation' }] };
@@ -174,6 +181,14 @@ test('author steps are proved by the agent and composed into the frozen theorem'
   assert.ok(source.indexOf('theorem target_step1') < source.indexOf('theorem target_step2'));
   assert.ok(source.indexOf('theorem target_step2') < source.indexOf('theorem target :'));
   assert.ok(containsObligation(FROZEN.leanSource, source, 'target'), 'the frozen header survives verbatim');
+  // The final recheck of a claim with no dependencies: every part brought its
+  // own `import`, and they must all end up at the top.
+  const recheck = composeLeanFile('', source);
+  assert.equal(recheck.split('\n').filter((l) => l.startsWith('import ')).length, 1);
+  assert.ok(recheck.startsWith('import Mathlib\n'));
+  const { runner } = fakeRunner({ steps: [], ladderCloses: new Set(['target']) });
+  assert.equal((await runner.check(recheck, { declarationName: 'target' })).status, 'ok', 'Lean accepts the recheck file');
+  assert.equal((await runner.check(source, { declarationName: 'target' })).status, 'error', 'and would reject it unhoisted');
   assert.ok(result.agentSpendUsd > 0);
 });
 
