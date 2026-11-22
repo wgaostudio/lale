@@ -596,6 +596,7 @@ Output a single JSON object:
 
 Rules:
 - Follow the author's argument. Do not supply a better proof, reorder the reasoning, or add steps the author did not make.
+- State each step as the author asserts it, even if you think it is false or unjustified. Do not comment on its truth or validity anywhere in the output: checking it is someone else's job, and a verdict in the step text biases that check.
 - One mathematical move per step: a construction, a case, an inequality, an application of a named result.
 - Each claim must stand alone given the theorem's hypotheses and the earlier steps: name the objects it speaks about.
 - The final step must be the theorem's conclusion.

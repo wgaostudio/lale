@@ -40,6 +40,13 @@ test('a false step must be found at the step, not just as an outcome', () => {
     citations: [], composition: composition('skipped'), agentSpendUsd: 1, proverModel: null, budget: null,
   }));
   assert.equal(wrongPlace.passed, false, 'right outcome, wrong reason');
+
+  // The live run wrote "n²"; the fixture says "n^2". Same thing.
+  const superscript = judgeEvalCase(fixture, result('proofIncomplete', {
+    steps: [step(1, 'For every natural number n, n² is even.', false, 'Fails at n = 1.'), step(2, 'n² + n is even', true)],
+    citations: [], composition: composition('skipped'), agentSpendUsd: 1, proverModel: null, budget: null,
+  }));
+  assert.deepEqual(superscript.failures, []);
   assert.match(wrongPlace.failures[0]!, /no failing step mentions/);
 });
 

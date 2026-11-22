@@ -15,6 +15,12 @@ import { ProverOptions, VerificationMode, VerificationOutcome, type RunResult } 
 
 const PASSING_OUTCOMES = new Set(['verified', 'verifiedGivenCitations']);
 
+/** Lowercase, with superscript digits spelled `^n`: models write n² as often as n^2. */
+function normalizeMath(text: string): string {
+  const superscripts: Record<string, string> = { '⁰': '0', '¹': '1', '²': '2', '³': '3', '⁴': '4', '⁵': '5', '⁶': '6', '⁷': '7', '⁸': '8', '⁹': '9' };
+  return text.toLowerCase().replace(/[⁰¹²³⁴⁵⁶⁷⁸⁹]+/g, (run) => `^${[...run].map((c) => superscripts[c]).join('')}`);
+}
+
 export const EvalCase = z.object({
   id: z.string().min(1),
   /** One line on what the case tests and what a failure would mean. */
@@ -26,7 +32,8 @@ export const EvalCase = z.object({
   expected: z.array(VerificationOutcome).min(1),
   /** A pass of this claim is a false acceptance: the theorem is false. */
   mustNotPass: z.boolean().default(false),
-  timeoutMinutes: z.number().positive().default(15),
+  /** Default 15, or 45 for Check proof steps: every Lean check reloads Mathlib, and a cited result alone takes a dozen. */
+  timeoutMinutes: z.number().positive().optional(),
   argument: z.object({
     allStepsProved: z.boolean().optional(),
     /** Some step that did not hold has a claim or gap report containing all of these (case-insensitive). */
@@ -41,10 +48,12 @@ export const EvalCase = z.object({
     })).optional(),
   }).optional(),
 });
-export type EvalCase = z.infer<typeof EvalCase>;
+export type EvalCase = z.infer<typeof EvalCase> & { timeoutMinutes: number };
 
 export function loadEvalCases(json: unknown): EvalCase[] {
-  const cases = z.array(EvalCase).parse(json);
+  const cases = z.array(EvalCase).parse(json).map((c) => ({
+    ...c, timeoutMinutes: c.timeoutMinutes ?? (c.mode === 'proofSkeleton' ? 45 : 15),
+  }));
   const ids = new Set<string>();
   for (const fixture of cases) {
     if (ids.has(fixture.id)) throw new Error(`Duplicate eval case id: ${fixture.id}`);
@@ -83,11 +92,11 @@ export function judgeEvalCase(fixture: EvalCase, result: RunResult | null): Eval
       failures.push(`steps not proved: ${argument.steps.filter((s) => !held(s)).map((s) => s.idx).join(', ')}`);
     }
     if (want.failingStepMentions) {
-      const needles = want.failingStepMentions.map((n) => n.toLowerCase());
-      const excluded = (want.failingStepNotMentions ?? []).map((n) => n.toLowerCase());
+      const needles = want.failingStepMentions.map(normalizeMath);
+      const excluded = (want.failingStepNotMentions ?? []).map(normalizeMath);
       const located = argument.steps.some((s) => {
-        const text = `${s.claim}\n${s.report ?? ''}`.toLowerCase();
-        return !held(s) && needles.every((n) => text.includes(n)) && !excluded.some((n) => s.claim.toLowerCase().includes(n));
+        const text = normalizeMath(`${s.claim}\n${s.report ?? ''}`);
+        return !held(s) && needles.every((n) => text.includes(n)) && !excluded.some((n) => normalizeMath(s.claim).includes(n));
       });
       if (!located) failures.push(`no failing step mentions ${want.failingStepMentions.join(' + ')}`);
     }
