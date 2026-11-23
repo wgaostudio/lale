@@ -52,3 +52,10 @@ Let $K(X)$ be the field of rational functions in indeterminates $x_{i,j}$.
   assert.match(ambient, /\[…\]/, 'and the cut is marked');
   assert.doesNotMatch(ambient, /maketitle|footnotetext|noindent|begingroup/, 'layout commands are dropped');
 });
+
+test('isolateScopes keeps imports at the top and wraps the rest', async () => {
+  const { isolateScopes } = await import('../src/pipeline/lean-scope.js');
+  assert.equal(isolateScopes('import Mathlib\nopen DirectSum\ntheorem t : True := trivial'),
+    'import Mathlib\nsection\nopen DirectSum\ntheorem t : True := trivial\nend');
+  assert.equal(isolateScopes('import Mathlib\n'), 'import Mathlib');
+});

@@ -28,6 +28,7 @@ import {
   type NamedFact,
 } from './agent/prover.js';
 import type { FrozenTheorem } from './agent/workspace.js';
+import { isolateScopes } from './lean-scope.js';
 
 // ---------------------------------------------------------------------------
 // Proof skeleton: checking the author's argument
@@ -315,6 +316,9 @@ export async function checkProofSkeleton(
     });
     addUsage(totalUsage, result.usage);
     agentSpendUsd += result.spentUsd;
+    // Out of credit is a fact about the account, not the proof: stop the run
+    // here rather than fail every remaining step the same way.
+    if (result.stopReason === 'credit') throw new BudgetExceededError(result.report ?? 'Model provider credit exhausted');
     return result;
   };
 
@@ -356,7 +360,7 @@ export async function checkProofSkeleton(
   // Rejected and unstated citations contribute nothing a step could use.
   const citationPrelude = citations
     .filter((c) => (c.status === 'assumed' || c.status === 'discharged') && c.leanSource)
-    .map((c) => c.leanSource!)
+    .map((c) => isolateScopes(c.leanSource!))
     .join('\n\n');
   const stepEnvironment = [depDecls, citationPrelude].filter(Boolean).join('\n\n');
 
@@ -398,7 +402,8 @@ export async function checkProofSkeleton(
       result.proof = proof.proof;
       addUsage(totalUsage, proof.usage);
       if (proof.proof.status === 'proved' && proof.proof.leanSource) {
-        proved.push(proof.proof.leanSource);
+        // Isolated: its opens must not change how later steps elaborate.
+        proved.push(isolateScopes(proof.proof.leanSource));
         provedFacts.push({ leanName: result.theoremName, text: spec.claim });
       }
     }

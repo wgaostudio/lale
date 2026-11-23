@@ -1,3 +1,4 @@
+import { isolateScopes } from './lean-scope.js';
 import type { ParsedDocument } from '@lale/document-parser';
 
 // ---------------------------------------------------------------------------
@@ -190,7 +191,7 @@ export function formatDependencyDeclarations(deps: ResolvedDependency[]): string
   return deps
     .map((d) =>
       d.leanDeclaration
-        ? d.leanDeclaration
+        ? isolateScopes(d.leanDeclaration)
         : `-- ${d.label}: ${d.statementText.replace(/\r?\n/g, '\n-- ')}`,
     )
     .join('\n');

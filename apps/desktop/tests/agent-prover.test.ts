@@ -192,9 +192,22 @@ test('a model error is retried, then reported as verificationBlocked', async () 
   let calls = 0;
   const client = { async chat() { calls++; throw new Error('503'); } } as unknown as ModelClient;
   const result = await runAgentProver({ ...base, client, runner });
-  assert.equal(calls, 3);
+  assert.equal(calls, 6, 'five retries for a transient failure');
   assert.equal(result.stopReason, 'modelError');
   assert.equal(result.outcome, 'verificationBlocked');
+
+  // Out of credit: no retries, and a reason of its own (live run: HTTP 402 mid-paper).
+  let creditCalls = 0;
+  const broke = { async chat() { creditCalls++; throw Object.assign(new Error('402 This request would exceed your available credits'), { status: 402 }); } } as unknown as ModelClient;
+  const noCredit = await runAgentProver({ ...base, client: broke, runner });
+  assert.equal(creditCalls, 1);
+  assert.equal(noCredit.stopReason, 'credit');
+
+  // Other client errors are not retried either.
+  let badCalls = 0;
+  const bad = { async chat() { badCalls++; throw Object.assign(new Error('400 bad request'), { status: 400 }); } } as unknown as ModelClient;
+  assert.equal((await runAgentProver({ ...base, client: bad, runner })).stopReason, 'modelError');
+  assert.equal(badCalls, 1);
 });
 
 test('turn and deadline limits stop the run', async () => {

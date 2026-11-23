@@ -32,6 +32,8 @@ interface Scenario {
   ladderCloses?: Set<string>;
   /** Step claims whose first Lean statement reads back wrong. */
   misstatedOnce?: Set<string>;
+  /** A line the formalizer puts before every step's theorem, e.g. `open Leaky`. */
+  stepPreamble?: string;
   /** What the agent does, keyed by purpose. */
   agent?: { step?: 'prove' | 'giveUp' | 'refute'; composition?: 'prove' | 'giveUp'; citation?: 'prove' | 'giveUp' | 'refute' };
 }
@@ -70,7 +72,18 @@ function fakeRunner(scenario: Scenario) {
       }
       const name = options.declarationName;
       if (!name) return { ...base, status: 'ok' };
-      const goal = goalOf(source, name);
+      // An `open Leaky` at the top level (outside any section) before the
+      // declaration changes how it elaborates, as a real `open` can.
+      let depth = 0;
+      let leaked = false;
+      for (const line of source.slice(0, source.indexOf(`theorem ${name} :`)).split('\n')) {
+        const t = line.trim();
+        if (t === 'section' || /^section\s/.test(t)) depth++;
+        else if (t === 'end' && depth > 0) depth--;
+        else if (t === 'open Leaky' && depth === 0) leaked = true;
+      }
+      const rawGoal = goalOf(source, name);
+      const goal = rawGoal && leaked ? `LEAKED:${rawGoal}` : rawGoal;
       if (!goal) return { ...base, status: 'blocked', diagnostics: [{ kind: 'error', message: 'Missing kernel declaration certificate' }] };
       const body = bodyOf(source, name);
       const isLadderOrComposition = TACTIC_LADDER.includes(body) || /^(exact|intros|simpa)\b/.test(body);
@@ -101,7 +114,7 @@ function fakeClients(scenario: Scenario) {
       calls.push(`stateStep:${index + 1}`);
       void claim;
       const name = `step${index + 1}`;
-      text = JSON.stringify({ theoremName: name, leanSource: `import Mathlib\ntheorem ${name} : ∀ n : Nat, P${index + 1} n := by sorry` });
+      text = JSON.stringify({ theoremName: name, leanSource: `import Mathlib\n${scenario.stepPreamble ? `${scenario.stepPreamble}\n` : ''}theorem ${name} : ∀ n : Nat, P${index + 1} n := by sorry` });
       stepCounter++;
     } else if (system.includes('autoformalization assistant')) {
       calls.push('stateCitation');
@@ -342,4 +355,33 @@ test('a cited result the prover refutes is rejected, never assumed', async () =>
   assert.match(result.citations[0]!.reason, /refuted it in Lean/);
   assert.equal(result.steps[0]!.proof.status, 'skipped');
   assert.deepEqual(agentPurposes, ['citation']);
+});
+
+test("one step's opens do not change how a later step elaborates (live: Lemma 3)", async () => {
+  // Every step's Lean source starts with `open Leaky`. Step 2 is frozen
+  // without step 1 in the file and proved with it; unisolated, step 1's open
+  // reached step 2 and the gate rejected a correct proof.
+  const { result } = await run({
+    steps: [{ claim: 'first fact' }, { claim: 'second fact' }],
+    stepPreamble: 'open Leaky',
+    ladderCloses: new Set(['target']),
+    agent: { step: 'prove' },
+  });
+  assert.deepEqual(result.steps.map((s) => s.proof.status), ['proved', 'proved']);
+  for (const source of result.provedSources) assert.match(source, /^import Mathlib\nsection\nopen Leaky\n/);
+});
+
+test('running out of model credit stops the whole run instead of failing each step', async () => {
+  const scenario: Scenario = { steps: [{ claim: 'first fact' }, { claim: 'second fact' }] };
+  const { runner } = fakeRunner(scenario);
+  const { client } = fakeClients(scenario);
+  let agentCalls = 0;
+  const broke = { async chat() { agentCalls++; throw Object.assign(new Error('402 This request would exceed your available credits'), { status: 402 }); } } as unknown as ModelClient;
+  await assert.rejects(
+    checkProofSkeleton(client, client, client, runner, FROZEN, CONTEXT, 'test', 'test', {
+      agent: { client: broke, pricing: { prompt: 1e-6, completion: 4e-6 }, mathlibRoot: null },
+    }),
+    /lack of credit/,
+  );
+  assert.equal(agentCalls, 1, 'step 2 never started');
 });

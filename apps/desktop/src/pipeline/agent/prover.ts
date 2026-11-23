@@ -51,7 +51,8 @@ const ELIDED_PREFIX_CHARS = 240;
 const MAX_IDLE_TURNS = 3;
 /** A turn smaller than this cannot reason and write a lemma; the budget is spent. */
 export const MIN_TURN_OUTPUT_TOKENS = 4096;
-const MAX_MODEL_RETRIES = 2;
+/** Transient failures (dropped connections, 5xx, 429) are retried with backoff up to 30 s. */
+const MAX_MODEL_RETRIES = 5;
 
 /** A step or theorem the agent may cite by name. */
 export interface NamedFact {
@@ -130,6 +131,8 @@ export type AgentStopReason =
   | 'aborted'
   | 'stalled'
   | 'modelError'
+  /** The provider refused for lack of credit (HTTP 402): nothing later in the run can succeed either. */
+  | 'credit'
   | 'environment';
 
 export interface AgentTranscriptEntry {
@@ -397,10 +400,16 @@ export async function runAgentProver(input: AgentProverInput): Promise<AgentProv
         if (error instanceof BudgetExceededError) {
           return stopped('budget', `Stopped at ${usd(spent())}: ${error.message}.`);
         }
-        if (attempt >= MAX_MODEL_RETRIES || input.signal?.aborted) {
+        const status = (error as { status?: unknown }).status;
+        if (status === 402 || /\b402\b.*credit/i.test(String(error))) {
+          return finish('verificationBlocked', 'credit', `The model provider refused for lack of credit: ${String(error).slice(0, 300)}`);
+        }
+        // Other client errors will not change on retry.
+        const permanent = typeof status === 'number' && status >= 400 && status < 500 && status !== 408 && status !== 429;
+        if (permanent || attempt >= MAX_MODEL_RETRIES || input.signal?.aborted) {
           return finish('verificationBlocked', 'modelError', `Model request failed: ${String(error)}`);
         }
-        await sleep(2000 * 2 ** attempt);
+        await sleep(Math.min(2000 * 2 ** attempt, 30_000));
       }
     }
     usage.inputTokens += reply.usage.inputTokens;

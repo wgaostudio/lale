@@ -456,7 +456,10 @@ export async function finalGate(
   }
   if (!result.certificate) return reject('Rejected: no kernel certificate for the theorem.');
   if (result.certificate.normalizedGoalTerm !== ws.frozen.normalizedGoalTerm) {
-    return reject('Rejected: the theorem elaborates to a different proposition than the frozen statement. A helper file changes how the statement is read (an instance, open, notation, or a definition shadowing a name it uses). Remove that interference.');
+    return reject('Rejected: the theorem elaborates to a different proposition than the frozen statement. '
+      + `${describeGoalDifference(ws.frozen.normalizedGoalTerm, result.certificate.normalizedGoalTerm)} `
+      + 'If you have helper files, one of them changes how the statement is read (an instance, open, notation, or a definition shadowing a name it uses); remove that interference. '
+      + 'If you have none, the difference comes from the surrounding declarations, which you cannot change: say so in give_up.');
   }
   return { accepted: true, reason: 'Accepted.', leanSource: ws.acceptedSource(), environmentFault: false };
 }
@@ -512,6 +515,15 @@ async function refute(ctx: ToolContext, body: string, explanation: string): Prom
       leanSource: ws.compose({ includeTheorem: true, theoremText: filled, includeDependencies: false }).source,
     },
   };
+}
+
+/** Where two kernel renderings of a goal first differ, with a little context. */
+export function describeGoalDifference(frozen: string, now: string): string {
+  let i = 0;
+  while (i < frozen.length && i < now.length && frozen[i] === now[i]) i++;
+  const from = Math.max(0, i - 80);
+  const clip = (text: string): string => text.slice(from, i + 160).replace(/\s+/g, ' ');
+  return `They first differ at character ${i}: frozen …${clip(frozen)}… / now …${clip(now)}…`;
 }
 
 async function submit(ctx: ToolContext): Promise<ToolOutcome> {
