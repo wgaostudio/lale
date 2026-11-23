@@ -541,6 +541,10 @@ async function checkCitation(
   const ladder = await tryTacticLadder(runner, header.leanSource, stmtName, depDecls);
   if (ladder) return discharged(ladder.leanSource, ladder.closedBy);
 
+  // Why it was not discharged, attempt by attempt: an easy citation left as
+  // an assumption is a lale failure worth diagnosing, not just a fact.
+  const attempts: string[] = ['tactic ladder did not close it'];
+  const oneLine = (text: string, max: number): string => text.replace(/\s+/g, ' ').slice(0, max);
   let agentResult: AgentProverResult | null = null;
   try {
     agentResult = await runAgent(
@@ -550,14 +554,25 @@ async function checkCitation(
     );
   } catch (err) {
     rethrowIfNotAboutTheProof(err);
+    attempts.push(`prover error: ${oneLine(String(err), 200)}`);
+  }
+  if (!options.agent) attempts.push('no prover configured');
+  if (agentResult && !(agentResult.outcome === 'verified' && agentResult.acceptedLeanSource)) {
+    attempts.push(`prover stopped (${agentResult.stopReason}) after ${agentResult.turns} turns, $${agentResult.spentUsd.toFixed(2)}`
+      + (agentResult.report ? `: ${oneLine(agentResult.report, 300)}` : ''));
   }
   if (agentResult?.outcome === 'verified' && agentResult.acceptedLeanSource) {
     const candidate = [definitionSource, agentResult.acceptedLeanSource, bridge].join('\n\n');
     const recheck = await runner.check(composeLeanFile(depDecls, candidate), { declarationName: `${leanName}_holds` });
     if (recheck.status === 'ok' && recheck.certificate) return discharged(agentResult.acceptedLeanSource, 'agent');
+    attempts.push(`prover proved it, but linking the proof to the citation failed (${recheck.status}): `
+      + oneLine(recheck.diagnostics.map((d) => d.message).join('; '), 400));
   }
 
-  return { ...result, status: 'assumed', reason: 'Stated faithfully and not refuted; not proved here', leanSource: definitionSource };
+  return {
+    ...result, status: 'assumed', leanSource: definitionSource,
+    reason: `Stated faithfully and not refuted; not proved here (${attempts.join('; ')})`,
+  };
 }
 
 function negatedObligation(source: string, theoremName: string, name: string): string {
