@@ -419,3 +419,40 @@ test('a small ceiling shrinks each turn instead of refusing to start', async () 
   assert.equal(broke.stopReason, 'budget');
   assert.equal(calls, 0);
 });
+
+test('a proof written but not submitted is checked when the run stops, and accepted if it holds', async () => {
+  // The live case: a 5-line proof of Fermat's little theorem, one turn short of the budget.
+  const { runner, calls } = fakeRunner();
+  const { client } = scriptedClient([
+    [{ name: 'set_proof', args: { body: 'intro n\nsimp' } }],
+    [{ name: 'check', args: {} }],
+  ]);
+  const result = await runAgentProver({ ...base, client, runner, maxTurns: 2 });
+  assert.equal(result.outcome, 'verified');
+  assert.equal(result.stopReason, 'accepted');
+  assert.equal(calls.at(-1)!.options.declarationName, 'target', 'through the same clean-room gate');
+  assert.deepEqual(calls.at(-1)!.options.allowTrustViolations ?? [], []);
+  assert.ok(result.transcript.some((t) => t.tool === 'submit (automatic, at stop)'));
+
+  // A rejected one stays a failure, and says why.
+  const sorryRun = await runAgentProver({
+    ...base, runner, maxTurns: 1,
+    client: scriptedClient([[{ name: 'set_proof', args: { body: 'sorry' } }]]).client,
+  });
+  assert.equal(sorryRun.outcome, 'proofIncomplete');
+  assert.match(sorryRun.report!, /checked at stop and rejected/);
+
+  // A cancelled run is not submitted on the user's behalf.
+  const controller = new AbortController();
+  const { runner: r2, calls: c2 } = fakeRunner();
+  const cancelled = await runAgentProver({
+    ...base, runner: r2, signal: controller.signal,
+    client: { async chat() {
+      controller.abort();
+      return { message: { role: 'assistant' as const, content: null, toolCalls: [{ id: 'x', name: 'set_proof', arguments: '{"body":"simp"}' }] },
+        finishReason: 'tool_calls', reasoning: null, usage: { inputTokens: 1, outputTokens: 1 } };
+    } } as unknown as ModelClient,
+  });
+  assert.equal(cancelled.stopReason, 'aborted');
+  assert.equal(c2.length, 0, 'no gate run after cancellation');
+});

@@ -8,7 +8,7 @@ import {
 } from '@lale/translator';
 import type { LeanRunner } from '@lale/lean-runner';
 import { Workspace, type FrozenTheorem } from './workspace.js';
-import { AGENT_TOOLS, HELPER_FILE_TOOLS, executeTool, toolsFor, workspaceSummary, type ToolContext } from './tools.js';
+import { AGENT_TOOLS, HELPER_FILE_TOOLS, executeTool, finalGate, toolsFor, workspaceSummary, type ToolContext } from './tools.js';
 
 // ---------------------------------------------------------------------------
 // Agentic prover
@@ -336,8 +336,24 @@ export async function runAgentProver(input: AgentProverInput): Promise<AgentProv
       transcript,
     };
   };
-  const stopped = (reason: AgentStopReason, why: string): AgentProverResult =>
-    finish('proofIncomplete', reason, `${why} Workspace at stop: ${workspaceSummary(workspace)}`);
+  // Before giving up, check what is there. A run can stop with a complete
+  // proof written but not yet submitted (in a live run, a 5-line proof of
+  // Fermat's little theorem one turn short of its budget), and checking it
+  // costs Lean time, not model spend. Not on cancellation: that is a request
+  // to stop, not a limit reached.
+  const stopped = async (reason: AgentStopReason, why: string): Promise<AgentProverResult> => {
+    let note = '';
+    if (reason !== 'aborted' && workspace.proof.trim()) {
+      const verdict = await finalGate(workspace, input.runner, ctx.checkTimeoutMs, ctx.gateConstraints);
+      transcript.push({
+        turn, elapsedMs: now() - started, spentUsd: spent(), tool: 'submit (automatic, at stop)',
+        input: '', output: abbreviate(verdict.reason),
+      });
+      if (verdict.accepted && verdict.leanSource) return finish('verified', 'accepted', null, verdict.leanSource);
+      if (!verdict.environmentFault) note = ` The proof in the workspace was checked at stop and rejected: ${abbreviate(verdict.reason, 300)}`;
+    }
+    return finish('proofIncomplete', reason, `${why}${note} Workspace at stop: ${workspaceSummary(workspace)}`);
+  };
 
   for (;;) {
     if (input.signal?.aborted) return stopped('aborted', 'Run was cancelled.');

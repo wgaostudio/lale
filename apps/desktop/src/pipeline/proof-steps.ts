@@ -156,8 +156,8 @@ export interface ProofSkeletonAgentConfig {
 }
 
 export const DEFAULT_STEP_BUDGET: AgentBudget = { ceilingUsd: 2, floorUsd: 0.25 };
-export const DEFAULT_COMPOSITION_BUDGET: AgentBudget = { ceilingUsd: 0.5, floorUsd: 0 };
-export const DEFAULT_CITATION_BUDGET: AgentBudget = { ceilingUsd: 0.3, floorUsd: 0 };
+export const DEFAULT_COMPOSITION_BUDGET: AgentBudget = { ceilingUsd: 1, floorUsd: 0 };
+export const DEFAULT_CITATION_BUDGET: AgentBudget = { ceilingUsd: 1, floorUsd: 0 };
 
 /**
  * Per-run presets. Uncalibrated starting points: `hard` is sized from one
