@@ -40,6 +40,8 @@ export const EvalCase = z.object({
     failingStepMentions: z.array(z.string()).optional(),
     /** ...and none of these, to tell the failing step apart from the conclusion that echoes it. */
     failingStepNotMentions: z.array(z.string()).optional(),
+    /** ...and it was refuted (Lean-checked counterexample), not merely left unproved. */
+    failingStepRefuted: z.boolean().optional(),
     /** Whether the steps should reach the theorem. */
     composes: z.boolean().optional(),
     citations: z.array(z.object({
@@ -96,9 +98,12 @@ export function judgeEvalCase(fixture: EvalCase, result: RunResult | null): Eval
       const excluded = (want.failingStepNotMentions ?? []).map(normalizeMath);
       const located = argument.steps.some((s) => {
         const text = normalizeMath(`${s.claim}\n${s.report ?? ''}`);
-        return !held(s) && needles.every((n) => text.includes(n)) && !excluded.some((n) => normalizeMath(s.claim).includes(n));
+        return !held(s) && needles.every((n) => text.includes(n)) && !excluded.some((n) => normalizeMath(s.claim).includes(n))
+          && (!want.failingStepRefuted || s.proofStatus === 'refuted');
       });
-      if (!located) failures.push(`no failing step mentions ${want.failingStepMentions.join(' + ')}`);
+      if (!located) {
+        failures.push(`no failing step${want.failingStepRefuted ? ' refuted in Lean' : ''} mentions ${want.failingStepMentions.join(' + ')}`);
+      }
     }
     if (want.composes !== undefined) {
       const composed = argument.composition?.status === 'proved';

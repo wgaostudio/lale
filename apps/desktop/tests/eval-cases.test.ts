@@ -7,9 +7,11 @@ import { judgeEvalCase, loadEvalCases } from '../src/eval-cases.js';
 const cases = loadEvalCases(JSON.parse(await readFile(new URL('../../../evals/claims/cases.json', import.meta.url), 'utf8')));
 const byId = (id: string) => cases.find((c) => c.id === id)!;
 
-function step(idx: number, claim: string, proved: boolean, report: string | null = null): ArgumentStep {
-  return { idx, claim, sourceText: '', status: 'checked', proofStatus: proved ? 'proved' : 'unproved', closedBy: proved ? 'agent' : null,
-    uses: [], cites: [], leanStatement: null, backtranslation: null, diagnostics: [], report, spentUsd: null, turns: null };
+function step(idx: number, claim: string, proved: boolean | 'refuted', report: string | null = null): ArgumentStep {
+  const proofStatus = proved === 'refuted' ? 'refuted' : proved ? 'proved' : 'unproved';
+  return { idx, claim, sourceText: '', status: 'checked', proofStatus, closedBy: proved ? 'agent' : null,
+    uses: [], cites: [], leanStatement: null, backtranslation: null, diagnostics: [], report,
+    refutation: proved === 'refuted' ? 'theorem s_refuted : ¬ (∀ n, Even (n ^ 2)) := by …' : null, spentUsd: null, turns: null };
 }
 
 function result(outcome: RunResult['outcome'], argument: RunResult['argument'] = null): RunResult {
@@ -30,7 +32,7 @@ test('the shipped eval cases load and are internally consistent', () => {
 test('a false step must be found at the step, not just as an outcome', () => {
   const fixture = byId('steps-false-step');
   const atStep = judgeEvalCase(fixture, result('proofIncomplete', {
-    steps: [step(1, 'For every natural number n, n^2 is even', false, 'Counterexample n = 1.'), step(2, 'parity', true)],
+    steps: [step(1, 'For every natural number n, n^2 is even', 'refuted', 'Counterexample n = 1.'), step(2, 'parity', true)],
     citations: [], composition: composition('skipped'), agentSpendUsd: 1, proverModel: null, budget: null,
   }));
   assert.deepEqual(atStep, { passed: true, falseAcceptance: false, failures: [] });
@@ -43,11 +45,18 @@ test('a false step must be found at the step, not just as an outcome', () => {
 
   // The live run wrote "n²"; the fixture says "n^2". Same thing.
   const superscript = judgeEvalCase(fixture, result('proofIncomplete', {
-    steps: [step(1, 'For every natural number n, n² is even.', false, 'Fails at n = 1.'), step(2, 'n² + n is even', true)],
+    steps: [step(1, 'For every natural number n, n² is even.', 'refuted', 'Fails at n = 1.'), step(2, 'n² + n is even', true)],
     citations: [], composition: composition('skipped'), agentSpendUsd: 1, proverModel: null, budget: null,
   }));
   assert.deepEqual(superscript.failures, []);
-  assert.match(wrongPlace.failures[0]!, /no failing step mentions/);
+
+  // Unproved is not enough here: the step is false, and lale should say so.
+  const merelyUnproved = judgeEvalCase(fixture, result('proofIncomplete', {
+    steps: [step(1, 'For every natural number n, n^2 is even', false, 'Could not prove it.')],
+    citations: [], composition: composition('skipped'), agentSpendUsd: 1, proverModel: null, budget: null,
+  }));
+  assert.match(merelyUnproved.failures.join(), /no failing step refuted in Lean mentions/);
+  assert.match(wrongPlace.failures[0]!, /no failing step refuted in Lean mentions/);
 });
 
 test('passing a false theorem is flagged as a false acceptance', () => {

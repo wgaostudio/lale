@@ -456,3 +456,70 @@ test('a proof written but not submitted is checked when the run stops, and accep
   assert.equal(cancelled.stopReason, 'aborted');
   assert.equal(c2.length, 0, 'no gate run after cancellation');
 });
+
+test('refute: a Lean-checked negation ends the run as refuted, whatever the floor', async () => {
+  const { runner, calls } = fakeRunner();
+  const { client } = scriptedClient([
+    [{ name: 'refute', args: { body: 'intro h\nexact absurd (h 1) (by decide)', explanation: 'Fails at n = 1.' } }],
+  ]);
+  const result = await runAgentProver({ ...base, client, runner, budget: { ceilingUsd: 5, floorUsd: 4 } });
+  assert.equal(result.outcome, 'refuted');
+  assert.equal(result.stopReason, 'refuted');
+  assert.equal(result.report, 'Fails at n = 1.');
+  assert.equal(result.turns, 1, 'no give-up floor applies to a certified counterexample');
+  const gate = calls.at(-1)!;
+  assert.equal(gate.options.declarationName, 'target_refuted');
+  assert.deepEqual(gate.options.allowTrustViolations ?? [], [], 'same clean-room rules as a proof');
+  assert.match(gate.source, /theorem target_refuted : ¬ \(∀ n : Nat, n \+ 0 = n\) := by\n  intro h/);
+  assert.match(result.refutationLeanSource!, /theorem target_refuted/);
+});
+
+test('refute: a helper that changes what the statement means cannot be used to refute it', async () => {
+  const { runner } = fakeRunner();
+  const { client, seen } = scriptedClient([
+    [{ name: 'write_file', args: { path: 'Evil.lean', content: '-- INTERFERE' } },
+     { name: 'refute', args: { body: 'simp', explanation: 'trust me' } }],
+    { text: 'hm' }, { text: 'hm' }, { text: 'hm' },
+  ]);
+  const result = await runAgentProver({ ...base, client, runner });
+  assert.notEqual(result.outcome, 'refuted');
+  const replies = seen.flat().filter((m) => m.role === 'tool').map((m) => (m as { content: string }).content);
+  assert.ok(replies.some((r) => r.includes('elaborates differently than the frozen one')));
+});
+
+test('composition: glue only, and refute is not offered', async () => {
+  const { runner } = fakeRunner();
+  const offered: string[][] = [];
+  const turns = [
+    [{ name: 'set_proof', args: { body: 'intro n\nexact ⟨step1 n, by positivity⟩' } }, { name: 'submit', args: {} }],
+    [{ name: 'set_proof', args: { body: 'intro n\n-- simp would also work\nexact step1 n' } }, { name: 'submit', args: {} }],
+  ];
+  let i = 0;
+  const seen: ChatMessage[][] = [];
+  const client = {
+    async chat(messages: ChatMessage[], tools: ChatToolSpec[]) {
+      offered.push(tools.map((t) => t.name));
+      seen.push(structuredClone(messages));
+      const turn = turns[i++]!;
+      return { message: { role: 'assistant' as const, content: null,
+        toolCalls: turn.map((c, j) => ({ id: `g${i}_${j}`, name: c.name, arguments: JSON.stringify(c.args) })) },
+        finishReason: 'tool_calls', reasoning: null, usage: { inputTokens: 10, outputTokens: 10 } };
+    },
+  } as unknown as ModelClient;
+  const result = await runAgentProver({
+    ...base, client, runner,
+    purpose: { kind: 'composition', steps: [{ leanName: 'step1', text: 's' }], citations: [], maxProofLines: 30 },
+  });
+  assert.equal(result.outcome, 'verified', 'logic-only proof accepted, even with "simp" in a comment');
+  assert.ok(!offered[0]!.includes('refute'));
+  const replies = seen.flat().filter((m) => m.role === 'tool').map((m) => (m as { content: string }).content);
+  assert.ok(replies.some((r) => /Rejected: positivity proves new mathematics/.test(r)), 'nested `by positivity` is caught');
+});
+
+test('findAutomationTactics: tactics anywhere, not names or comments', async () => {
+  const { findAutomationTactics } = await import('../src/pipeline/agent/tools.js');
+  assert.deepEqual(findAutomationTactics('exact ⟨h1, by nlinarith [sq_nonneg x]⟩'), ['nlinarith']);
+  assert.deepEqual(findAutomationTactics('simp!\nexact?'), ['simp', 'exact?']);
+  assert.deepEqual(findAutomationTactics('obtain ⟨k, hk⟩ := step1 a ha\nexact Nat.decide_eq_true hk -- omega'), []);
+  assert.deepEqual(findAutomationTactics('have hsimp := step2\nexact hsimp'), []);
+});

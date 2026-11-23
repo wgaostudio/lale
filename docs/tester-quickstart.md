@@ -82,7 +82,7 @@ These are all of them; nothing else is ever reported.
 | `verified` | Lean accepted a proof, with no `sorry` and no unexpected axioms. |
 | `verifiedGivenCitations` | In *Check proof steps*: every step of your argument was proved in Lean and they compose to the theorem, **given the results you cite**. Each cited result was stated in Lean, compared with your wording, and screened for easy refutation, but not proved. The log lists them. A cited result Mathlib can prove is discharged and does not appear here. A claim that cites a `verifiedGivenCitations` claim inherits its assumptions. |
 | `formalized` | The statement (or every proof step) was stated in Lean successfully. |
-| `proofIncomplete` | A step could not be stated or proved, or the proof attempts ran out. The log names which. |
+| `proofIncomplete` | A step could not be stated or proved, or the proof attempts ran out, or (in *Check proof steps*) the steps do not reach the theorem by logic alone. The log names which. A step marked **false** was refuted: Lean accepted its negation, and the counterexample is shown. |
 | `malformedClaim` | The statement itself would not type-check in Lean after several attempts. Usually the prose is ambiguous about types or quantifiers. |
 | `malformedProof` | A proof was asked for and the claim has no adjacent `\begin{proof}` block. |
 | `formalizationUnfaithful` | The Lean version does not say what your prose says. The log gives the judge's reason — usually a real ambiguity in the writing. |

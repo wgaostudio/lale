@@ -1270,6 +1270,8 @@ async function executePipeline(
           ok ? 'info' : 'warning',
           ok
             ? `Step ${step.idx} proved (${step.proof.closedBy}): ${step.claim}`
+            : step.proof.status === 'refuted'
+              ? `Step ${step.idx} is false: Lean accepts its negation: ${step.claim} — ${unprovedDetail.slice(0, 600)}`
             : step.status !== 'checked'
               ? `Step ${step.idx} could not be stated in Lean (${step.status}): ${step.claim} — ${step.diagnostics.join('; ').slice(0, 400)}`
               : `Step ${step.idx} stated but not proved: ${step.claim} — ${unprovedDetail.slice(0, 600)}`,

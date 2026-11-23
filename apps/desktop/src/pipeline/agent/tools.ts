@@ -1,8 +1,10 @@
 import {
   LEAN_UNAVAILABLE,
+  fillObligation,
   isLeanDeclarationName,
   parseObligation,
   scanTrustViolations,
+  stripLeanCommentsAndStrings,
   type LeanCheckResult,
   type LeanRunner,
 } from '@lale/lean-runner';
@@ -33,6 +35,11 @@ export interface ToolContext {
   allowedTools?: ReadonlySet<string>;
   /** Extra conditions on an accepted proof (composition mode). */
   gateConstraints?: GateConstraints;
+  /**
+   * The kernel's rendering of `¬ P`, elaborated once without the helper
+   * files, so a refutation is held to the statement as frozen.
+   */
+  refutationGoal?: string;
 }
 
 export interface GateConstraints {
@@ -40,6 +47,33 @@ export interface GateConstraints {
   maxProofLines?: number;
   /** Reject when the workspace holds any helper file. */
   noHelperFiles?: boolean;
+  /** Reject any automation tactic: the proof may only combine what is in scope. */
+  glueOnly?: boolean;
+}
+
+/**
+ * Tactics that prove new mathematics on their own. A composition that uses one
+ * is supplying a piece of the argument the author's steps did not, which is
+ * exactly the gap composition is there to find. Matched anywhere in the proof,
+ * nested `by` blocks included, outside comments and strings.
+ */
+const AUTOMATION_TACTICS = [
+  'simp', 'simp_all', 'simpa', 'dsimp', 'simp_arith', 'norm_num', 'norm_cast', 'push_cast', 'omega', 'linarith',
+  'nlinarith', 'polyrith', 'positivity', 'aesop', 'decide', 'ring', 'ring_nf', 'field_simp', 'tauto', 'itauto',
+  'gcongr', 'grind', 'linear_combination', 'abel', 'noncomm_ring', 'interval_cases', 'fin_cases', 'induction',
+  'induction\'', 'exact?', 'apply?', 'rw?', 'simp?', 'hint', 'library_search', 'continuity', 'measurability',
+  'fun_prop', 'bv_decide', 'nlinarith!', 'linarith!', 'slim_check', 'plausible',
+];
+
+export function findAutomationTactics(proof: string): string[] {
+  const code = stripLeanCommentsAndStrings(proof);
+  const found = new Set<string>();
+  for (const tactic of AUTOMATION_TACTICS) {
+    const escaped = tactic.replace(/[.*+?^${}()|[\]\\']/g, '\\$&');
+    // Not part of a longer name, and not a qualified lemma name (Nat.decide_eq).
+    if (new RegExp(`(?<![\\w.'])${escaped}(?![\\w'])`).test(code)) found.add(tactic);
+  }
+  return [...found];
 }
 
 /** File-writing tools; composition mode is offered none of them. */
@@ -53,6 +87,7 @@ export type ToolControl =
   | { kind: 'continue' }
   | { kind: 'accepted'; leanSource: string }
   | { kind: 'giveUp'; report: string }
+  | { kind: 'refuted'; leanSource: string; explanation: string }
   | { kind: 'environmentFault'; message: string };
 
 export interface ToolOutcome {
@@ -144,6 +179,18 @@ export const AGENT_TOOLS: ChatToolSpec[] = [
     name: 'submit',
     description: 'Run the final clean-room check: no sorry, standard axioms only, the frozen statement unchanged. On success the run ends verified. On failure you get the reason and may continue.',
     parameters: { type: 'object', properties: {} },
+  },
+  {
+    name: 'refute',
+    description: 'Prove that the frozen statement is FALSE: give a tactic proof of its negation ¬ P. The harness builds the negated theorem from the frozen statement itself; your helper files may be used. If Lean accepts it under the same clean-room rules, the statement is certified false and the run ends. Use this as soon as you have a counterexample.',
+    parameters: {
+      type: 'object',
+      properties: {
+        body: { type: 'string', description: 'Tactic block proving ¬ P (after `:= by`).' },
+        explanation: { type: 'string', description: 'The counterexample or reason, in a sentence or two, for the author.' },
+      },
+      required: ['body', 'explanation'],
+    },
   },
   {
     name: 'give_up',
@@ -244,6 +291,8 @@ export async function executeTool(ctx: ToolContext, name: string, rawArguments: 
         return await search(ctx, strArray(args, 'terms'), typeof args['limit'] === 'number' ? args['limit'] : undefined);
       case 'submit':
         return await submit(ctx);
+      case 'refute':
+        return await refute(ctx, str(args, 'body'), str(args, 'explanation').trim());
       case 'give_up': {
         const report = str(args, 'report').trim();
         if (!report) return ok('Error: the report must say what was and was not proved.');
@@ -377,6 +426,12 @@ export async function finalGate(
   if (constraints.maxProofLines !== undefined && proofLines > constraints.maxProofLines) {
     return reject(`Rejected: the proof is ${proofLines} lines; at most ${constraints.maxProofLines} are allowed here. A longer argument means the steps do not yet carry the proof.`);
   }
+  if (constraints.glueOnly) {
+    const automation = findAutomationTactics(ws.proof);
+    if (automation.length) {
+      return reject(`Rejected: ${automation.join(', ')} prove${automation.length === 1 ? 's' : ''} new mathematics, and here the theorem must follow from the steps by logic alone (intro, exact, apply, refine, obtain, rcases, constructor, use, have, specialize, assumption, rfl). If the steps need more to reach the theorem, that is a gap in the argument: give_up and say what is missing.`);
+    }
+  }
 
   const composition = ws.compose();
   const headerText = parseObligation(ws.frozen.leanSource, ws.frozen.theoremName).header
@@ -404,6 +459,59 @@ export async function finalGate(
     return reject('Rejected: the theorem elaborates to a different proposition than the frozen statement. A helper file changes how the statement is read (an instance, open, notation, or a definition shadowing a name it uses). Remove that interference.');
   }
   return { accepted: true, reason: 'Accepted.', leanSource: ws.acceptedSource(), environmentFault: false };
+}
+
+/**
+ * The refutation gate: the same clean-room rules as `finalGate`, applied to
+ * `¬ P`. The negated theorem is built from the frozen statement, and its
+ * kernel rendering must equal `¬ P` as elaborated without the helper files.
+ */
+async function refute(ctx: ToolContext, body: string, explanation: string): Promise<ToolOutcome> {
+  if (!body.trim()) return ok('Error: empty refutation.');
+  if (!explanation) return ok('Error: say what the counterexample is.');
+  const ws = ctx.workspace;
+  const header = ws.refutationHeader();
+
+  if (ctx.refutationGoal === undefined) {
+    const bare = ws.compose({ includeTheorem: true, theoremText: header.text, omitFiles: true });
+    const elaborated = await ctx.runner.check(bare.source, {
+      allowTrustViolations: ['sorry'], declarationName: header.name, wallClockCapMs: ctx.checkTimeoutMs,
+    });
+    if (isEnvironmentFault(elaborated)) return fault(elaborated);
+    if (elaborated.status !== 'ok' || !elaborated.certificate) {
+      return ok(`The negated statement did not elaborate, so it cannot be refuted here: ${elaborated.diagnostics.map((d) => d.message).join('; ').slice(0, 800)}`);
+    }
+    ctx.refutationGoal = elaborated.certificate.normalizedGoalTerm;
+  }
+
+  let filled: string;
+  try {
+    filled = fillObligation(header.text, body, header.name);
+  } catch (error) {
+    return ok(`Error: ${error instanceof Error ? error.message : String(error)}`);
+  }
+  const composition = ws.compose({ includeTheorem: true, theoremText: filled });
+  const result = await ctx.runner.check(composition.source, { declarationName: header.name, wallClockCapMs: ctx.checkTimeoutMs });
+  if (isEnvironmentFault(result)) return fault(result);
+  if (result.status !== 'ok' || !result.certificate) {
+    const violations = result.trustViolations.map((v) => v.name);
+    return ok([
+      `Refutation rejected (${result.status}).`,
+      violations.length ? `Trust policy: ${violations.join(', ')}.` : '',
+      formatDiagnostics(result.diagnostics.map((d) => (d.line === undefined ? d : { ...d, line: d.line - 1 })), composition.segments),
+    ].filter(Boolean).join('\n'));
+  }
+  if (result.certificate.normalizedGoalTerm !== ctx.refutationGoal) {
+    return ok('Refutation rejected: with your helper files, the negated statement elaborates differently than the frozen one. Remove that interference.');
+  }
+  return {
+    content: 'Refuted: Lean accepts the negation of the frozen statement.',
+    control: {
+      kind: 'refuted',
+      explanation,
+      leanSource: ws.compose({ includeTheorem: true, theoremText: filled, includeDependencies: false }).source,
+    },
+  };
 }
 
 async function submit(ctx: ToolContext): Promise<ToolOutcome> {

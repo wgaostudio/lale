@@ -131,8 +131,16 @@ without a stored mode default to `full`.
   probes, `#check` lookups, Mathlib declaration search) within a dollar budget
   ($2 ceiling, $0.25 floor per step by default; below the floor a give-up is
   refused). It is told to justify the author's step, not to find its own route,
-  and the step's statement is frozen so it cannot. Composition gets no helper
-  files and at most 30 lines. Acceptance is a clean-room gate: the frozen
+  and the step's statement is frozen so it cannot. A step it can show false is
+  *refuted*: Lean accepts the negation of the frozen step, under the same
+  clean-room rules, and the step is reported false with that counterexample.
+  Composition must get the theorem from the steps by logic alone — no helper
+  files, at most 30 lines, and no automation that proves new facts (`simp`,
+  `linarith`, `omega`, `norm_num`, `positivity`, `aesop`, `decide`, `ring`,
+  `induction`, …), so a piece of the argument the author left out is reported
+  as a gap even when it is easy. Known gap: a Mathlib lemma named directly in a
+  term (`exact ⟨step1 x, add_pos …⟩`) is not yet caught; that needs a check of
+  the constants the proof uses. Acceptance is a clean-room gate: the frozen
   statement spliced in verbatim, no trust allowances, standard axioms only, and
   the kernel's goal term equal to the one frozen beforehand. Without prices,
   steps fall back to the one-shot prover. Verify mode still uses the one-shot

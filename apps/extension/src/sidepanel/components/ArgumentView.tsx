@@ -12,12 +12,14 @@ import { LatexBlock } from './Latex';
 function stepTone(step: ArgumentStep): Tone {
   if (step.status !== 'checked') return 'bad';
   if (step.proofStatus === 'proved') return 'ok';
+  if (step.proofStatus === 'refuted') return 'bad';
   return step.proofStatus === 'skipped' ? 'idle' : 'warn';
 }
 
 function stepLabel(step: ArgumentStep): string {
   if (step.status !== 'checked') return step.status === 'blocked' ? 'could not be checked' : 'could not be stated';
   if (step.proofStatus === 'proved') return 'proved';
+  if (step.proofStatus === 'refuted') return 'false';
   return step.proofStatus === 'skipped' ? 'not attempted' : 'not proved';
 }
 
@@ -48,6 +50,8 @@ function modelLabel(modelId: string | null): string | null {
 export function summarizeArgument(argument: ProofArgument): string {
   const proved = argument.steps.filter((s) => s.status === 'checked' && s.proofStatus === 'proved').length;
   const parts = [`${proved}/${argument.steps.length} steps proved`];
+  const refuted = argument.steps.filter((s) => s.proofStatus === 'refuted').length;
+  if (refuted) parts.push(`${refuted} shown false in Lean`);
   const assumed = argument.citations.filter((c) => c.status === 'assumed').length;
   if (assumed) parts.push(`${assumed} cited result${assumed === 1 ? '' : 's'} assumed`);
   const composition = argument.composition;
@@ -90,9 +94,11 @@ function StepItem({ step, citations }: { step: ArgumentStep; citations: Argument
       </div>
       <LatexBlock source={step.claim} />
       {failed && step.report ? (
-        <div className="callout" data-tone="warn">
+        <div className="callout" data-tone={step.proofStatus === 'refuted' ? 'bad' : 'warn'}>
           <div className="callout-body">
-            <span className="callout-title">What the prover found</span>
+            <span className="callout-title">
+              {step.proofStatus === 'refuted' ? 'This step is false: Lean checked a counterexample' : 'What the prover found'}
+            </span>
             <p>{step.report}</p>
           </div>
         </div>
@@ -101,6 +107,7 @@ function StepItem({ step, citations }: { step: ArgumentStep; citations: Argument
         <p className="lale-muted argument-diagnostic">{step.diagnostics[0]}</p>
       ) : null}
       <LeanDetails title="Lean statement" source={step.leanStatement} backtranslation={step.backtranslation} />
+      {step.refutation ? <LeanDetails title="Lean counterexample" source={step.refutation} backtranslation={null} /> : null}
     </li>
   );
 }

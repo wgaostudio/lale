@@ -220,7 +220,8 @@ export const ArgumentStep = z.object({
   sourceText: z.string(),
   /** Whether the step could be stated in Lean. */
   status: z.enum(['pending', 'checked', 'failed', 'blocked']),
-  proofStatus: z.enum(['proved', 'unproved', 'skipped']),
+  /** `refuted`: Lean accepted the step's negation, so it is false as stated. */
+  proofStatus: z.enum(['proved', 'refuted', 'unproved', 'skipped']),
   closedBy: z.string().nullable(),
   uses: z.array(z.number().int()),
   cites: z.array(z.number().int()),
@@ -230,6 +231,8 @@ export const ArgumentStep = z.object({
   diagnostics: z.array(z.string()),
   /** The prover's account when it could not prove the step — often the gap. */
   report: z.string().nullable(),
+  /** Lean proof of the step's negation, when refuted: the certified counterexample. */
+  refutation: z.string().nullable().default(null),
   spentUsd: z.number().nullable(),
   turns: z.number().int().nullable(),
 });

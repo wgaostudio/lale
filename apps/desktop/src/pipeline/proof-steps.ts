@@ -61,13 +61,16 @@ import type { FrozenTheorem } from './agent/workspace.js';
 export type ProofStepStatus = 'checked' | 'failed' | 'blocked';
 
 export interface ProofStepProof {
-  status: 'proved' | 'unproved' | 'skipped';
+  /** `refuted`: Lean accepted the step's negation — the step is false as stated. */
+  status: 'proved' | 'refuted' | 'unproved' | 'skipped';
   /** The tactic that closed it, `model` for a one-shot proof, `agent` for the agent, else null. */
   closedBy: string | null;
   leanSource: string | null;
   diagnostics: string[];
   /** The agent's account when it could not prove the step: often the gap itself. */
   report?: string | null;
+  /** The Lean proof of the step's negation, when refuted. */
+  refutationSource?: string | null;
   spentUsd?: number;
   turns?: number;
 }
@@ -557,6 +560,13 @@ async function checkCitation(
     attempts.push(`prover error: ${oneLine(String(err), 200)}`);
   }
   if (!options.agent) attempts.push('no prover configured');
+  // A cited result the prover refutes is false as formalized: never a premise.
+  if (agentResult?.outcome === 'refuted') {
+    return {
+      ...result, status: 'rejected', leanSource: definitionSource,
+      reason: `The prover refuted it in Lean, so as formalized it is false and cannot be assumed: ${oneLine(agentResult.report ?? '', 300)}`,
+    };
+  }
   if (agentResult && !(agentResult.outcome === 'verified' && agentResult.acceptedLeanSource)) {
     attempts.push(`prover stopped (${agentResult.stopReason}) after ${agentResult.turns} turns, $${agentResult.spentUsd.toFixed(2)}`
       + (agentResult.report ? `: ${oneLine(agentResult.report, 300)}` : ''));
@@ -760,6 +770,16 @@ async function proveStep(
       if (result.outcome === 'verified' && result.acceptedLeanSource) {
         return { proof: { status: 'proved', closedBy: 'agent', leanSource: result.acceptedLeanSource, diagnostics: [], report: null, ...common }, usage };
       }
+      if (result.outcome === 'refuted' && result.refutationLeanSource) {
+        return {
+          proof: {
+            status: 'refuted', closedBy: 'agent', leanSource: null,
+            diagnostics: ['Lean accepts the negation of this step: it is false as stated'],
+            report: result.report, refutationSource: result.refutationLeanSource, ...common,
+          },
+          usage,
+        };
+      }
       return {
         proof: {
           status: 'unproved', closedBy: null, leanSource: null,
@@ -826,7 +846,6 @@ function compositionTactics(stepNames: string[]): string[] {
   return [
     `exact ${last}`,
     `intros; exact ${last} ‹_›`,
-    `simpa using ${last}`,
     `intros; apply ${last} <;> assumption`,
     `exact fun h => ${last} h`,
   ];

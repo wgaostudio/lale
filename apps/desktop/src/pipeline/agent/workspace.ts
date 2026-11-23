@@ -165,9 +165,29 @@ export class Workspace {
    * agent's proof (or `sorry` if none is set yet). `suffix` is appended after
    * the helper files in place of the theorem, for probes.
    */
-  compose(options: { upTo?: string; suffix?: string; includeTheorem?: boolean; includeDependencies?: boolean } = {}): Composition {
+  /**
+   * `theorem <name>_refuted : ¬ (<P>) := by sorry`, built by the harness from
+   * the frozen statement and its opens. The agent supplies only the proof.
+   */
+  refutationHeader(): { name: string; text: string } {
+    const header = splitImports(this.frozen.leanSource);
+    const obligation = parseObligation(header.body, this.frozen.theoremName);
+    const name = `${this.frozen.theoremName}_refuted`;
+    return { name, text: `${obligation.preamble}theorem ${name} : ¬ (${obligation.proposition}) := by sorry` };
+  }
+
+  compose(options: {
+    upTo?: string;
+    suffix?: string;
+    includeTheorem?: boolean;
+    includeDependencies?: boolean;
+    /** Placed in the theorem's slot instead of the frozen theorem (a refutation). */
+    theoremText?: string;
+    /** Leave the helper files out (to elaborate a statement without the agent's influence). */
+    omitFiles?: boolean;
+  } = {}): Composition {
     const includeTheorem = options.includeTheorem ?? (options.upTo === undefined && options.suffix === undefined);
-    let paths = this.order;
+    let paths = options.omitFiles ? [] : this.order;
     if (options.upTo !== undefined) {
       const index = this.order.indexOf(options.upTo);
       if (index < 0) throw new Error(`No file "${options.upTo}".`);
@@ -185,7 +205,9 @@ export class Workspace {
       parts.push({ label: path, text: file.body, wrap: this.helperNamespace });
     }
     if (options.suffix !== undefined) parts.push({ label: '<probe>', text: options.suffix.replace(/\s+$/, '') });
-    if (includeTheorem) {
+    if (includeTheorem && options.theoremText !== undefined) {
+      parts.push({ label: '<theorem>', text: options.theoremText.replace(/\s+$/, '') });
+    } else if (includeTheorem) {
       const filled = this.proofBody.trim()
         ? fillObligation(header.body, this.proofBody, this.frozen.theoremName)
         : header.body;

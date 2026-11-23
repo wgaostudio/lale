@@ -45,6 +45,7 @@ for (const entry of entries) {
     if (s['backtranslation']) console.log(`      reads:  ${flat(s['backtranslation'])}`);
     for (const d of (s['diagnostics'] as string[] | undefined) ?? []) console.log(`      why:    ${flat(d, 600)}`);
     if (s['report']) console.log(`      prover: ${flat(s['report'], 800)}`);
+    if (s['refutation']) console.log(`      refuted in Lean: ${flat(s['refutation'], 600)}`);
   }
   for (const c of (argument['citations'] as Array<Record<string, unknown>>) ?? []) {
     console.log(`   cited ${c['name']}: ${c['status']} — ${flat(c['reason'])}`);

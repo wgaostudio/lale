@@ -122,6 +122,7 @@ export interface AgentProverInput {
 
 export type AgentStopReason =
   | 'accepted'
+  | 'refuted'
   | 'gaveUp'
   | 'budget'
   | 'turns'
@@ -151,10 +152,13 @@ export type AgentEvent =
   | { type: 'stop'; reason: AgentStopReason; turn: number; spentUsd: number };
 
 export interface AgentProverResult {
-  outcome: 'verified' | 'proofIncomplete' | 'verificationBlocked';
+  /** `refuted`: Lean accepted the negation of the frozen statement — it is false as stated. */
+  outcome: 'verified' | 'refuted' | 'proofIncomplete' | 'verificationBlocked';
   stopReason: AgentStopReason;
   /** Helpers plus the filled theorem, when accepted. */
   acceptedLeanSource: string | null;
+  /** Helpers plus the proof of `¬ P`, when refuted. */
+  refutationLeanSource: string | null;
   /** The agent's own account when it gave up, or the harness's when it stopped it. */
   report: string | null;
   turns: number;
@@ -180,6 +184,7 @@ How the workspace works:
 - Helper files (definitions, lemmas) are concatenated, in order, ahead of the theorem. Later files may use earlier ones. Each file is wrapped in the namespace given below, so from the main proof refer to a helper as <namespace>.name, or write \`open <namespace> in\` before a tactic.
 - set_proof sets the tactic block after \`:= by\` for the frozen theorem.
 - check elaborates everything; sorry is allowed there so you can scaffold top-down. probe tests scratch code (exact?, apply?, rw?, simp?, trace_state in an example). lookup prints exact types. search_mathlib finds declarations by literal terms.
+- refute proves the frozen statement FALSE (a proof of its negation), under the same rules. Use it the moment you have a counterexample: it ends the run with a certified finding.
 - submit runs the clean-room check. It rejects: sorry/admit, any axiom beyond propext, Classical.choice, Quot.sound, native_decide, unsafe, #commands, set_option, attribute, macros/syntax/elab, IO, imports outside Mathlib/Std/Init, and any change to how the frozen statement elaborates.
 
 Working habits:
@@ -194,8 +199,8 @@ const PURPOSE_SYSTEM: Record<AgentPurpose['kind'], string> = {
   theorem: `Your goal: any correct proof of the theorem. The author's proof is a hint, not a requirement; if it rests on results Mathlib lacks, find another route or prove what you need from scratch.`,
   authorStep: `Your goal: check ONE step of the author's proof. The frozen statement is that step, as the author asserts it. Justify it the way the author does: from the theorem's hypotheses, the earlier steps (in scope as lemmas), the results the author cites (they appear as hypotheses of the statement, each a Prop definition you can unfold), and routine Mathlib facts. Helper lemmas that fill in detail the author left implicit are fine; replacing the author's argument with a different one is not the job.
 Do not try to prove the whole theorem. Later steps are not available.
-If the step does not follow from what is available — it is false, or the argument has a gap — that is a finding about the author's proof, and the most useful thing you can report. Say exactly what is missing in give_up: which inference fails, a counterexample if you find one, or the extra hypothesis that would make it go through.`,
-  composition: `Your goal: show the theorem follows from the author's proved steps. Every step is in scope as a lemma; cited results appear as hypotheses. The proof must be short and must use no helper files: the steps are supposed to carry the argument, and this checks that they do. If they do not reach the theorem, give_up and say what link is missing.`,
+If the step is false as stated, refute it: a Lean-checked counterexample is the strongest finding about the author's proof, and it ends the run. If it is true but does not follow from what is available — a gap in the argument — say exactly what is missing in give_up: which inference fails, or the extra hypothesis that would make it go through.`,
+  composition: `Your goal: show the theorem follows from the author's proved steps by logic alone. Every step is in scope as a lemma; cited results appear as hypotheses. Use only tactics that combine what is in scope — intro, exact, apply, refine, obtain, rcases, cases, constructor, use, have, specialize, assumption, rfl — and no helper files. Automation that proves new facts (simp, linarith, omega, norm_num, positivity, aesop, decide, ring, …) is rejected: if the theorem needs a fact the steps do not provide, the author's argument has a gap there. Then give_up and say exactly which fact is missing.`,
 };
 
 export function agentSystemPrompt(purpose: AgentPurpose): string {
@@ -290,7 +295,7 @@ export async function runAgentProver(input: AgentProverInput): Promise<AgentProv
   const purpose: AgentPurpose = input.purpose ?? { kind: 'theorem' };
   const workspace = new Workspace(input.frozen, input.dependencyDeclarations);
   const allowedTools = purpose.kind === 'composition'
-    ? new Set(AGENT_TOOLS.map((t) => t.name).filter((n) => !(HELPER_FILE_TOOLS as readonly string[]).includes(n)))
+    ? new Set(AGENT_TOOLS.map((t) => t.name).filter((n) => !(HELPER_FILE_TOOLS as readonly string[]).includes(n) && n !== 'refute'))
     : undefined;
   const tools = toolsFor(allowedTools);
   const ctx: ToolContext = {
@@ -300,7 +305,7 @@ export async function runAgentProver(input: AgentProverInput): Promise<AgentProv
     mathlibRoot: input.mathlibRoot ?? null,
     ...(allowedTools ? { allowedTools } : {}),
     ...(purpose.kind === 'composition'
-      ? { gateConstraints: { noHelperFiles: true, maxProofLines: purpose.maxProofLines } }
+      ? { gateConstraints: { noHelperFiles: true, maxProofLines: purpose.maxProofLines, glueOnly: true } }
       : {}),
   };
   const usage: TokenUsage = { inputTokens: 0, outputTokens: 0 };
@@ -318,12 +323,14 @@ export async function runAgentProver(input: AgentProverInput): Promise<AgentProv
     stopReason: AgentStopReason,
     report: string | null,
     acceptedLeanSource: string | null = null,
+    refutationLeanSource: string | null = null,
   ): AgentProverResult => {
     input.onEvent?.({ type: 'stop', reason: stopReason, turn, spentUsd: spent() });
     return {
       outcome,
       stopReason,
       acceptedLeanSource,
+      refutationLeanSource,
       report,
       turns: turn,
       spentUsd: spent(),
@@ -444,6 +451,12 @@ export async function runAgentProver(input: AgentProverInput): Promise<AgentProv
       if (control.kind === 'accepted') {
         answerRemaining(index);
         return finish('verified', 'accepted', null, control.leanSource);
+      }
+      // A certified counterexample ends the run whatever the floor: there is
+      // nothing left to find, and nothing more to spend on.
+      if (control.kind === 'refuted') {
+        answerRemaining(index);
+        return finish('refuted', 'refuted', control.explanation, null, control.leanSource);
       }
       if (control.kind === 'environmentFault') {
         answerRemaining(index);

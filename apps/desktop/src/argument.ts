@@ -32,7 +32,7 @@ const ints = (v: unknown): number[] => (Array.isArray(v) ? v.filter((x): x is nu
 const strings = (v: unknown): string[] => (Array.isArray(v) ? v.filter((x): x is string => typeof x === 'string') : []);
 
 const STEP_STATUSES = new Set(['pending', 'checked', 'failed', 'blocked']);
-const PROOF_STATUSES = new Set(['proved', 'unproved', 'skipped']);
+const PROOF_STATUSES = new Set(['proved', 'refuted', 'unproved', 'skipped']);
 
 export function readProofArgument(db: Database, runId: string): ProofArgument | null {
   const stepRows = db
@@ -63,6 +63,7 @@ export function readProofArgument(db: Database, runId: string): ProofArgument | 
       backtranslation: str(artifacts['backtranslation']),
       diagnostics: [...strings(artifacts['diagnostics']), ...strings(proof['diagnostics'])],
       report: str(proof['report']),
+      refutation: str(proof['refutationSource']),
       spentUsd: num(proof['spentUsd']),
       turns: num(proof['turns']),
     };

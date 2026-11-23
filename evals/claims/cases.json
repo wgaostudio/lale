@@ -34,7 +34,7 @@
     "claimId": "thm:sq-plus",
     "latex": "\\begin{theorem}\\label{thm:sq-plus} For every natural number $n$, $n^2 + n$ is even.\\end{theorem}\n\\begin{proof}For every natural number $n$, $n^2$ is even. Also $n^2$ and $n$ have the same parity. Hence $n^2 + n$ is the sum of two even numbers, so it is even.\\end{proof}",
     "expected": ["proofIncomplete"],
-    "argument": { "failingStepMentions": ["n^2", "even"], "failingStepNotMentions": ["n^2 + n", "n^2+n"] }
+    "argument": { "failingStepMentions": ["n^2", "even"], "failingStepNotMentions": ["n^2 + n", "n^2+n"], "failingStepRefuted": true }
   },
   {
     "id": "steps-false-theorem",
@@ -44,7 +44,7 @@
     "latex": "\\begin{theorem}\\label{thm:odd-prime} Every odd natural number $n > 1$ is prime.\\end{theorem}\n\\begin{proof}Since $n$ is odd, $2$ does not divide $n$. A number with no factor $2$ has no proper factors at all. Hence $n$ is prime.\\end{proof}",
     "expected": ["proofIncomplete"],
     "mustNotPass": true,
-    "argument": { "failingStepMentions": ["factor"] }
+    "argument": { "failingStepMentions": ["factor"], "failingStepRefuted": true }
   },
   {
     "id": "steps-citation-discharged",

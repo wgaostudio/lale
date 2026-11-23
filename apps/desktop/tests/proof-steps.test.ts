@@ -33,7 +33,7 @@ interface Scenario {
   /** Step claims whose first Lean statement reads back wrong. */
   misstatedOnce?: Set<string>;
   /** What the agent does, keyed by purpose. */
-  agent?: { step?: 'prove' | 'giveUp'; composition?: 'prove' | 'giveUp'; citation?: 'prove' | 'giveUp' };
+  agent?: { step?: 'prove' | 'giveUp' | 'refute'; composition?: 'prove' | 'giveUp'; citation?: 'prove' | 'giveUp' | 'refute' };
 }
 
 function goalOf(source: string, name: string): string | null {
@@ -141,7 +141,9 @@ function fakeClients(scenario: Scenario) {
       const action = scenario.agent?.[purpose as 'step'] ?? 'giveUp';
       const script = action === 'prove'
         ? [[['set_proof', { body: 'intro n\nexact helper n' }], ['submit', {}]]]
-        : [[['give_up', { report: `cannot do the ${purpose}: missing link` }]]];
+        : action === 'refute'
+          ? [[['refute', { body: 'intro h\nexact h', explanation: `the ${purpose} fails at n = 1` }]]]
+          : [[['give_up', { report: `cannot do the ${purpose}: missing link` }]]];
       const calls = script[Math.min(turn, script.length - 1)]!;
       return {
         message: { role: 'assistant' as const, content: null,
@@ -319,4 +321,25 @@ test('assumptions inherited from a cited claim become premises of every step and
   for (const s of result.steps) assert.match(s.leanSource!, /: laleCite_three_1 → \(/);
   assert.equal(result.composition.status, 'proved');
   assert.deepEqual(result.composition.conditionalOn, ['laleCite_three_1']);
+});
+
+test('a step the prover refutes in Lean is reported as false, with the counterexample', async () => {
+  const { result } = await run({ steps: [{ claim: 'every n squared is even' }, { claim: 'the conclusion' }], agent: { step: 'refute' } });
+  const first = result.steps[0]!;
+  assert.equal(first.proof.status, 'refuted');
+  assert.equal(first.proof.report, 'the step fails at n = 1');
+  assert.match(first.proof.refutationSource!, /theorem target_step1_refuted : ¬ \(∀ n : Nat, P1 n\)/);
+  assert.equal(result.composition.status, 'skipped');
+});
+
+test('a cited result the prover refutes is rejected, never assumed', async () => {
+  const { result, agentPurposes } = await run({
+    citations: [{ name: 'a false lemma', statement: 'every n is 0' }],
+    steps: [{ claim: 'apply it', cites: [1] }],
+    agent: { step: 'prove', citation: 'refute' },
+  });
+  assert.equal(result.citations[0]!.status, 'rejected');
+  assert.match(result.citations[0]!.reason, /refuted it in Lean/);
+  assert.equal(result.steps[0]!.proof.status, 'skipped');
+  assert.deepEqual(agentPurposes, ['citation']);
 });
