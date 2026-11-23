@@ -299,7 +299,19 @@ export class LeanRunner {
       const preamble = name === undefined ? '' : 'import Lean\n';
       await writeFile(tmpFile, `${preamble}${source}\n${probe}`, 'utf8');
 
-      const result = await this.runLean(tmpFile, options.wallClockCapMs);
+      const ran = await this.runLean(tmpFile, options.wallClockCapMs);
+      const { unlocated, ...result } = ran as LeanCheckResult & { unlocated?: boolean };
+      if (unlocated) {
+        // Lean failed without saying where. If a trivial file fails too, Lean
+        // itself is broken and the run should stop; otherwise the source is at
+        // fault, and its author (often the prover) gets the full output.
+        const canary = await this.environmentWorks();
+        if (!canary.ok) {
+          return blockedResult(`${LEAN_UNAVAILABLE}: a file with no imports fails too, so the Lean install is broken; `
+            + `reprovision it. ${canary.output || result.diagnostics.at(-1)?.message || ''}`);
+        }
+        return result;
+      }
       if (name === undefined || result.status !== 'ok') return result;
       return applyCertificate(result, marker, name, options.allowTrustViolations ?? []);
     } catch (error) {
@@ -364,6 +376,7 @@ export class LeanRunner {
       let timedOut = false;
       let outputExceeded = false;
       let spawnError: Error | undefined;
+      let unlocated = false;
 
       const kill = (): void => {
         if (child.pid && process.platform !== 'win32') {
@@ -424,16 +437,17 @@ export class LeanRunner {
               + `and that ${ELAN_BIN_DIR} is readable.`,
           });
         } else if (!outputExceeded && signal === null && code !== 0 && diagnostics.length === 0) {
-          // Nonzero, but Lean said nothing about the file: it never checked
-          // it. `lake` failing to load a broken package, a missing toolchain,
-          // a corrupt Mathlib checkout. Reported as `error`, this reached the
-          // model as "your statement does not type-check" and ended runs as
-          // malformedClaim; it is the environment, and the run should stop.
-          status = 'blocked';
+          // Nonzero, and nothing tied to a line of the file. Either Lean never
+          // checked it (a broken `lake` workspace, a corrupt Mathlib checkout)
+          // or it rejected the file in a way it reports without a position (an
+          // import that does not exist). `check` tells the two apart; here it
+          // is an error carrying all the output either way.
+          status = 'error';
+          unlocated = true;
           diagnostics.push({
             kind: 'error',
-            message: `${LEAN_UNAVAILABLE}: exited with code ${code} before checking the file. `
-              + `Check the Lean install (reprovision if needed). ${stderr.trim().slice(0, 2000)}`,
+            message: `Lean exited with code ${code} without a diagnostic tied to a line of the file. Output: `
+              + `${`${stdout.trim()}\n${stderr.trim()}`.trim().slice(-2000) || '(none)'}`,
           });
         } else if (outputExceeded || signal !== null || code !== 0) {
           status = 'error';
@@ -454,9 +468,33 @@ export class LeanRunner {
           elapsedMs: Date.now() - startMs,
           stdout,
           stderr,
+          ...(unlocated ? { unlocated: true } : {}),
         });
       });
     });
+  }
+
+  private canaryOkUntil = 0;
+
+  /**
+   * Can this toolchain check a trivial file with no imports? Used only after
+   * a failure Lean did not tie to a line, to tell a broken environment from a
+   * file Lean rejected. A pass is remembered for a few minutes; a failure is
+   * not, so a repaired install is noticed at once.
+   */
+  private async environmentWorks(): Promise<{ ok: boolean; output: string }> {
+    if (Date.now() < this.canaryOkUntil) return { ok: true, output: '' };
+    const file = join(this.config.projectDir, 'Checks', `canary_${randomUUID()}.lean`);
+    try {
+      await mkdir(join(this.config.projectDir, 'Checks'), { recursive: true });
+      await writeFile(file, 'example : True := trivial\n', 'utf8');
+      const result = await this.runLean(file);
+      const ok = result.status === 'ok';
+      if (ok) this.canaryOkUntil = Date.now() + 5 * 60_000;
+      return { ok, output: `${result.stdout.trim()}\n${result.stderr.trim()}`.trim().slice(-2000) };
+    } finally {
+      await unlink(file).catch(() => undefined);
+    }
   }
 }
 

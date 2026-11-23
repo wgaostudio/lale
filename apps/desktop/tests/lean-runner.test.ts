@@ -20,6 +20,8 @@ interface Stub {
   hangMs?: number;
   /** Bytes of filler to print, for the output cap. */
   floodBytes?: number;
+  /** Fail (exit 1, this stdout, no position) only for files that import something. */
+  failImportsWith?: string;
 }
 
 function runnerWith(stub: Stub, config: Record<string, unknown> = {}): {
@@ -39,6 +41,7 @@ const source = fs.readFileSync(file, 'utf8');
 // The probe the harness appends carries the nonce a real Lean run would echo.
 const nonce = (/LALE_CERT_([0-9a-f-]+)/.exec(source) || [])[1] || 'no-nonce';
 const stub = ${JSON.stringify(stub)};
+if (stub.failImportsWith && /^import /m.test(source)) { process.stdout.write(stub.failImportsWith + '\\n'); process.exit(1); }
 if (stub.floodBytes) process.stdout.write('x'.repeat(stub.floodBytes));
 if (stub.stdout) process.stdout.write(String(stub.stdout).split('$NONCE').join(nonce) + '\\n');
 if (stub.stderr) process.stderr.write(String(stub.stderr) + '\\n');
@@ -200,8 +203,19 @@ test('a nonzero exit before Lean checks the file is an environment fault, with t
   });
   const result = await runner.check(THEOREM, { declarationName: 't' });
 
+  // A file with no imports fails the same way, so it is the install.
   assert.equal(result.status, 'blocked');
-  assert.match(result.diagnostics.at(-1)!.message, /^Lean could not run: exited with code 1.*could not resolve 'HEAD'/s);
+  assert.match(result.diagnostics.at(-1)!.message, /^Lean could not run: a file with no imports fails too.*could not resolve 'HEAD'/s);
+});
+
+test('a failure Lean does not tie to a line, in a working install, is an error in the source', async () => {
+  // The live case: the prover's file failed without a line number while Lean
+  // itself was fine, and the old rule stopped the prover as "Lean is broken".
+  const { runner } = runnerWith({ failImportsWith: 'error: object file Mathlib/NoSuch.olean of module Mathlib.NoSuch does not exist' });
+  const result = await runner.check('import Mathlib.NoSuch\ntheorem t : True := by trivial', { declarationName: 't' });
+  assert.equal(result.status, 'error');
+  assert.match(result.diagnostics.at(-1)!.message, /without a diagnostic tied to a line.*Mathlib\.NoSuch does not exist/s);
+  assert.ok(!('unlocated' in result), 'internal flag does not leak');
 });
 
 test('a nonzero exit with Lean errors about the file is still an error in the source', async () => {
